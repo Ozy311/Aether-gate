@@ -1,0 +1,252 @@
+#
+# Aether-gate — IC-9700 LAN UDP base: reliability layer + timers.
+# Copyright (C) 2026 Nigel Fenton (G0JKN). GPL-3.0-or-later.
+# Ported from github.com/w5jwp/SDR9700 (GPL-3.0): UdpBase.cpp/.h. Attribution preserved.
+#
+"""Shared UDP transport for the IC-9700 LAN protocol (control / CI-V / audio streams).
+
+Provides the bits the radio insists on or it drops you: session ids, a background
+RX reader thread, the are-you-there/0x06 discovery, a tracked send-sequence with a
+TX history buffer, ping/idle/retransmit timer threads, and the missing-seq tracker.
+
+The KEY thing a serial probe gets wrong (and why login goes unanswered): the radio
+needs the ping(500ms)/idle(100ms)/retransmit(100ms) cadence running CONTINUOUSLY,
+on their own clocks, throughout the auth dialog. This class runs them as threads.
+"""
+import socket
+import struct
+import threading
+import time
+
+PING_PERIOD = 0.500
+IDLE_PERIOD = 0.100
+RETRANSMIT_PERIOD = 0.100
+AREYOUTHERE_PERIOD = 0.500
+CONTROL_SIZE = 0x10
+PING_SIZE = 0x15
+MAX_MISSING = 50
+BUFSIZE = 500
+
+
+def _now_ms():
+    return int(time.monotonic() * 1000) & 0xFFFFFFFF
+
+
+class UdpBase:
+    def __init__(self, local_ip, radio_ip, radio_port, bind_port=0, name="base"):
+        self.local_ip = local_ip
+        self.radio_ip = radio_ip
+        self.radio_port = radio_port
+        self.name = name
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind((local_ip, bind_port))
+        self.sock.settimeout(0.05)
+        self.local_port = self.sock.getsockname()[1]
+        o = local_ip.split(".")
+        self.my_id = ((int(o[2]) << 24) | (int(o[3]) << 16) | (self.local_port & 0xFFFF))
+        self.remote_id = 0
+
+        self._send_seq = 1               # tracked-packet counter (starts at 1)
+        self._ping_seq = 0
+        self._lock = threading.Lock()
+        self._tx_hist = {}               # seq -> (bytes, time)
+        self._rx_seq = {}                # seq -> time (radio->us tracking)
+        self._rx_missing = {}            # seq -> retry count
+        self._run = False
+        self._connected = False          # got I-am-here
+        self._t_reader = None
+        self._t_timers = None
+        self._last_ping = 0.0
+        self._last_idle = 0.0
+        self._last_retx = 0.0
+        # subclasses set this to a callable(packet_bytes) for non-control payloads
+        self.on_data = None
+
+    # --- low-level send ---------------------------------------------------
+    def _send(self, data):
+        try:
+            self.sock.sendto(data, (self.radio_ip, self.radio_port))
+        except OSError:
+            pass
+
+    def _control(self, typ, seq=0, ln=CONTROL_SIZE):
+        return struct.pack("<IHHII", ln, typ, seq, self.my_id, self.remote_id)
+
+    def send_control(self, typ, seq=0):
+        self._send(self._control(typ, seq))
+
+    def send_tracked(self, buf):
+        """Send a tracked packet: stamp the next send_seq into [6:8], keep a copy."""
+        with self._lock:
+            seq = self._send_seq
+            b = bytearray(buf)
+            struct.pack_into("<H", b, 6, seq & 0xFFFF)
+            if seq == 0:                 # rollover clears the window
+                self._tx_hist.clear()
+            if len(self._tx_hist) > BUFSIZE:
+                self._tx_hist.pop(next(iter(self._tx_hist)))
+            self._tx_hist[seq] = (bytes(b), time.monotonic())
+            self._send_seq = (self._send_seq + 1) & 0xFFFF
+        self._send(bytes(b))
+        return seq
+
+    def send_idle(self):
+        # idle keepalive — TRACKED (SDR9700 wires idleTimer to sendControl(true,0,0))
+        self.send_tracked(self._control(0x00, 0))
+
+    def send_ping(self):
+        p = bytearray(PING_SIZE)
+        struct.pack_into("<IHHII", p, 0, PING_SIZE, 0x07, self._ping_seq, self.my_id, self.remote_id)
+        p[0x10] = 0x00
+        struct.pack_into("<I", p, 0x11, _now_ms())
+        self._ping_seq = (self._ping_seq + 1) & 0xFFFF
+        self._send(bytes(p))
+
+    # --- discovery --------------------------------------------------------
+    def start(self):
+        self._run = True
+        self._t_reader = threading.Thread(target=self._reader, daemon=True)
+        self._t_timers = threading.Thread(target=self._timer_loop, daemon=True)
+        self._t_reader.start()
+        self._t_timers.start()
+        self.send_control(0x03)          # are-you-there
+
+    def stop(self):
+        self._run = False
+        try:
+            self.send_control(0x05, 0x00)  # disconnect/idle close
+        except Exception:
+            pass
+
+    # --- timer thread (the cadence the radio needs) -----------------------
+    def _timer_loop(self):
+        while self._run:
+            now = time.monotonic()
+            if self._connected:
+                if now - self._last_ping >= PING_PERIOD:
+                    self.send_ping(); self._last_ping = now
+                if now - self._last_idle >= IDLE_PERIOD:
+                    self.send_idle(); self._last_idle = now
+                if now - self._last_retx >= RETRANSMIT_PERIOD:
+                    self._send_retransmit_requests(); self._last_retx = now
+            time.sleep(0.02)
+
+    def _send_retransmit_requests(self):
+        with self._lock:
+            if not self._rx_missing:
+                return
+            if len(self._rx_missing) > MAX_MISSING:
+                self._rx_missing.clear(); self._rx_seq.clear(); return
+            ranges = b""
+            drop = []
+            for seq, cnt in list(self._rx_missing.items()):
+                if seq == 0:
+                    continue
+                if cnt < 4:
+                    ranges += struct.pack("<HH", seq, seq)
+                    self._rx_missing[seq] = cnt + 1
+                else:
+                    drop.append(seq)
+            for s in drop:
+                self._rx_missing.pop(s, None)
+        if ranges:
+            ln = CONTROL_SIZE + len(ranges)
+            pkt = struct.pack("<IHHII", ln, 0x01, 0, self.my_id, self.remote_id) + ranges
+            self._send(pkt)
+
+    # --- reader thread ----------------------------------------------------
+    def _reader(self):
+        while self._run:
+            try:
+                d = self.sock.recvfrom(4096)[0]
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if len(d) < CONTROL_SIZE:
+                continue
+            typ = struct.unpack("<H", d[4:6])[0]
+            self._handle(d, typ)
+
+    def _handle(self, d, typ):
+        # I-am-here -> capture remote id, send our 0x06, go connected
+        if typ == 0x04:
+            self.remote_id = struct.unpack("<I", d[8:12])[0]
+            self.send_control(0x06, 0x01)
+            self._connected = True
+            self._on_iamhere()
+            return
+        if typ == 0x06:
+            self._on_iamready()
+            return
+        if typ == 0x07:                          # ping request -> echo as reply
+            if len(d) >= PING_SIZE and d[0x10] == 0x00:
+                r = bytearray(d); r[0x10] = 0x01
+                struct.pack_into("<I", r, 8, self.my_id)
+                struct.pack_into("<I", r, 12, self.remote_id)
+                self._send(bytes(r))
+            return
+        if typ == 0x01:                          # radio asks us to retransmit
+            self._answer_retransmit(d)
+            return
+        if typ == 0x00:                          # idle/data marker — track seq if non-zero
+            seq = struct.unpack("<H", d[6:8])[0]
+            if seq != 0:
+                self._track_rx(seq)
+            # a len>0x10 type-0 packet carries tracked payload -> hand up
+            if len(d) > CONTROL_SIZE and self.on_data:
+                self.on_data(d)
+            return
+        # any other tracked reply (login/token/status/caps) -> hand up
+        if self.on_data:
+            self.on_data(d)
+
+    def _answer_retransmit(self, d):
+        # We don't keep much history pre-auth; reply "not available" (type 0x00, that seq)
+        if len(d) == CONTROL_SIZE:
+            rseq = struct.unpack("<H", d[6:8])[0]
+            with self._lock:
+                hit = self._tx_hist.get(rseq)
+            if hit:
+                self._send(hit[0])
+            else:
+                self.send_control(0x00, rseq)
+        else:
+            pl = d[CONTROL_SIZE:]
+            for i in range(0, len(pl) - 3, 4):
+                first, last = struct.unpack("<HH", pl[i:i+4])
+                for sq in range(first, (last + 1) & 0x1FFFF):
+                    sq &= 0xFFFF
+                    with self._lock:
+                        hit = self._tx_hist.get(sq)
+                    if hit:
+                        self._send(hit[0])
+                    elif sq != 0xFFFF:
+                        self.send_control(0x00, sq)
+
+    def _track_rx(self, seq):
+        with self._lock:
+            if not self._rx_seq:
+                self._rx_seq[seq] = time.monotonic()
+                return
+            last = max(self._rx_seq)
+            gap = (seq - last) & 0xFFFF
+            if seq < min(self._rx_seq) or (gap if gap < 0x8000 else gap - 0x10000) > MAX_MISSING:
+                self._rx_seq.clear(); self._rx_missing.clear()
+                self._rx_seq[seq] = time.monotonic(); return
+            if seq not in self._rx_seq:
+                if ((seq - last) & 0xFFFF) > 1:
+                    f = (last + 1) & 0xFFFF
+                    while f != seq:
+                        self._rx_missing.setdefault(f, 0)
+                        f = (f + 1) & 0xFFFF
+                self._rx_seq[seq] = time.monotonic()
+            else:
+                self._rx_missing.pop(seq, None)
+
+    # --- hooks for subclasses --------------------------------------------
+    def _on_iamhere(self):
+        pass
+
+    def _on_iamready(self):
+        pass
