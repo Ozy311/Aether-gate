@@ -800,10 +800,13 @@ class Radio:
         dests = [("255.255.255.255", DISCOVERY_PORT)] + ([(self.ae_ip, DISCOVERY_PORT)] if self.ae_ip else [])
         while self.run:
             if self.enabled:                       # "powered off" -> stop advertising
-                msg = (f"name={self.station} model={self.model} serial={self.serial} version={VERSION} "
+                msg = (f"name={self.station} nickname={self.station} model={self.model} "
+                       f"serial={self.serial} version={VERSION} "
                        f"ip={self.ip} port={self.port} status=Available mf_enable=1 "
                        f"slices={self.max_slices} pans={self.max_slices} "   # capacity -> AE enables +RX
                        f"max_licensed_version=3").encode()   # rebuilt each tick -> live model change propagates
+                # AE's RadioDiscovery.cpp displays `nickname` (not `name`) as the chooser/status label
+                # (RadioDiscovery.h: .arg(model, nickname, callsign)). Send both so the label populates.
                 for d in dests:
                     try: s.sendto(msg, d)
                     except OSError: pass
