@@ -130,6 +130,7 @@ DAX_SID_BASE   = 0x48000040  # base stream id for dax_rx (per-radio: + radio_id*
                              # existing audio_loop streams the golden clip unchanged on the DAX id.
 
 AUDIO_SRC_SILENCE = "silence"  # DEFAULT: send silence (no audio) — a spectrum bench shouldn't blast a tone
+AUDIO_SRC_DEMOD = "demod"      # Aether-gate: real demodulated RF from the adapter (adapter.get_audio)
 AUDIO_SRC_TONE  = "tone"    # sine tone at audio_tone_hz (opt-in)
 AUDIO_SRC_NOISE = "noise"   # gaussian band noise
 AUDIO_SRC_WAV   = "wav"     # WAV file playback (looped)
@@ -755,7 +756,9 @@ class Radio:
         self.audio_thread = None
         self.audio_tone_hz = 440.0 + radio_id * 220.0  # distinct tone per radio (A4, C#5, …)
         self.audio_reduced_bw = False  # set True when AE sends 'client set send_reduced_bw_dax=1'
-        self.audio_source   = AUDIO_SRC_SILENCE  # default silent: SILENCE | TONE | NOISE | WAV
+        self.audio_source   = AUDIO_SRC_SILENCE  # default silent: SILENCE | TONE | NOISE | WAV | DEMOD
+        if adapter is not None and hasattr(adapter, "get_audio"):
+            self.audio_source = AUDIO_SRC_DEMOD   # a real radio: demodulate live RF -> AE hears it
         self.audio_wav_path = None             # filesystem path to WAV file (used when source=wav)
         # dax_rx stream state (RADE / digital decode path). AE arms this via
         # 'stream create type=dax_rx dax_channel=N' when a slice goes RADE/DIGU;
@@ -1351,6 +1354,12 @@ class Radio:
                 elif src == AUDIO_SRC_TONE:
                     mono = [amp * math.sin(2 * math.pi * self.audio_tone_hz * (sample_t + i) / AUDIO_RATE)
                             for i in range(AUDIO_FRAMES)]
+                elif src == AUDIO_SRC_DEMOD and self.adapter is not None \
+                        and hasattr(self.adapter, "get_audio"):
+                    # Aether-gate: real demodulated RF from the adapter at the active slice.
+                    slice_hz = self.slice_freq * 1e6
+                    a = self.adapter.get_audio(AUDIO_FRAMES, slice_hz=slice_hz, mode=self.slice_mode)
+                    mono = a if a is not None else [0.0] * AUDIO_FRAMES   # silence while IQ fills
                 else:  # AUDIO_SRC_SILENCE (default) — no audio. The DEFAULT so the bench is quiet.
                     mono = [0.0] * AUDIO_FRAMES
 
