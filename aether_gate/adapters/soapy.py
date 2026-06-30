@@ -32,9 +32,11 @@ class SoapyAdapter(RadioAdapter):
 
     provides = "iq"
 
-    def __init__(self, driver="rtlsdr", device_args="", samp_rate=2_048_000,
+    def __init__(self, driver="rtlsdr", device_args="", samp_rate=2_040_000,
                  gain_db=40.0, center_hz=14_100_000.0, model="FLEX-6700",
                  serial="GATE0001", station="aether-gate 1", direct_samp=None, agc=False):
+        # NB default 2.040 MS/s (not 2.048) = EXACTLY 85 * 24 kHz, so audio decimation
+        # is integer with no drift/underrun. RTL accepts it; panadapter span is fine.
         self.driver = driver
         self.device_args = device_args
         self.samp_rate = float(samp_rate)
@@ -58,10 +60,12 @@ class SoapyAdapter(RadioAdapter):
         self._audio_q = collections.deque(maxlen=64)  # raw IQ blocks queued for the demodulator
         self._nco_phase = 0.0               # persistent mixer phase (continuity across blocks)
         self._decim = None                  # samp_rate / AUDIO_RATE (integer-ish); set in open()
-        self._lpf = None                    # decimating FIR taps
-        self._lpf_state = None              # FIR overlap state
+        self._stages = []                   # decimation factors per stage
+        self._stage_firs = []               # [taps, overlap_state, M] per stage
         self._iq_resid = None               # leftover IQ samples between audio calls
-        self._audio_gain = 8.0              # post-demod gain (SSB audio is quiet); tweakable
+        self._audio_gain = 60.0             # post-demod fixed gain (SSB baseband is small)
+        self._agc_level = 0.05              # AGC running estimate of audio level
+        self._agc_target = 0.25             # desired RMS-ish output level
 
     # --- lifecycle -------------------------------------------------------
     def open(self):
@@ -95,17 +99,24 @@ class SoapyAdapter(RadioAdapter):
         self._stream = self._sdr.setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32)
         self._sdr.activateStream(self._stream)
 
-        # --- demod setup: design a decimating low-pass (samp_rate -> AUDIO_RATE) ---
-        self._decim = max(1, int(round(self.samp_rate / AUDIO_RATE)))
-        # cutoff = SSB bandwidth, normalised to the input rate; windowed-sinc FIR (numpy only)
-        cutoff = SSB_BW_HZ / self.samp_rate
-        ntaps = 64 * self._decim if self._decim < 64 else 4096   # enough taps for sharp anti-alias
-        ntaps = min(ntaps, 8192)
-        m = (ntaps - 1) / 2.0
-        idx = np.arange(ntaps) - m
-        h = np.sinc(2 * cutoff * idx) * np.hamming(ntaps)        # LP prototype
-        self._lpf = (h / h.sum()).astype(np.float64)
-        self._lpf_state = np.zeros(ntaps - 1, dtype=np.complex128)
+        # --- demod setup: STAGED decimation (samp_rate -> AUDIO_RATE) ---
+        # A single huge FIR at 2.048 MS/s is ~13x too slow on a Pi5 (70ms/call vs 5.3ms
+        # budget -> audio starves -> popping). Decimate in cheap stages instead: each
+        # stage is a short half/quarter-band FIR then [::M], so the expensive taps only
+        # ever run at progressively lower rates. 85 = 5 * 17; do 5 then 17.
+        self._decim = max(1, int(round(self.samp_rate / AUDIO_RATE)))   # 85 for 2.048M/24k
+        self._stages = self._factor_decim(self._decim)                  # e.g. [5, 17]
+        rate = self.samp_rate
+        self._stage_firs = []                                            # (taps, state) per stage
+        for M in self._stages:
+            # short anti-alias FIR for this stage: cutoff at the post-decimation Nyquist
+            ntaps = 4 * M + 1
+            cutoff = 0.45 / M                                            # normalised to this stage's input rate
+            idx = np.arange(ntaps) - (ntaps - 1) / 2.0
+            h = (np.sinc(2 * cutoff * idx) * np.hamming(ntaps))
+            h = (h / h.sum()).astype(np.float64)
+            self._stage_firs.append([h, np.zeros(ntaps - 1, dtype=np.complex128), M])
+            rate /= M
         self._iq_resid = np.zeros(0, dtype=np.complex64)
 
         self._run = True
@@ -148,12 +159,33 @@ class SoapyAdapter(RadioAdapter):
             elif n < 0:
                 time.sleep(0.001)           # overflow/timeout — keep the stream alive, don't spin hot
 
+    @staticmethod
+    def _factor_decim(D):
+        """Factor a decimation D into a few small stages (largest-first ~ balanced)."""
+        factors = []
+        for p in (5, 4, 3, 2):
+            while D % p == 0 and D // p >= 1:
+                factors.append(p); D //= p
+        if D > 1:
+            factors.append(D)               # leftover prime (e.g. 17) as one stage
+        return factors or [1]
+
     # --- control --------------------------------------------------------
+    def set_slice(self, slice_hz):
+        """Set the DEMOD target frequency. Tune in software within the existing IQ
+        window; only physically retune the V4 if the slice nears the window edge
+        (keeps the hardware centre stable so small tuning doesn't thrash the tuner)."""
+        slice_hz = float(slice_hz)
+        self._slice_hz = slice_hz
+        # usable window = ~80% of the sample rate (avoid the filtered band edges)
+        edge = 0.40 * self.samp_rate
+        if abs(slice_hz - self.center_hz) > edge:
+            # slice left the window -> recentre the hardware ON the slice
+            self._retune_to = slice_hz
+
     def retune(self, center_hz):
-        # AE retunes the slice; the hardware centre follows the pan, but the slice
-        # we DEMODULATE is this frequency (may be offset within the pan).
-        self._slice_hz = float(center_hz)
-        self._retune_to = float(center_hz)  # picked up by the reader thread
+        # Legacy/explicit hardware recentre (e.g. a band-change pan set).
+        self._retune_to = float(center_hz)
 
     def set_mode(self, mode):
         self._mode = (mode or "USB").upper()
@@ -174,10 +206,10 @@ class SoapyAdapter(RadioAdapter):
         """Return n_samples of 24 kHz mono audio (float, ~[-1,1]) demodulated from
         the live IQ at the slice frequency. None if not enough IQ buffered yet."""
         np = self._np
-        if np is None or self._lpf is None:
+        if np is None or not self._stage_firs:
             return None
         if slice_hz is not None:
-            self._slice_hz = float(slice_hz)
+            self.set_slice(slice_hz)        # sets demod target + hardware retune if off-window
         if mode is not None:
             self._mode = mode.upper()
 
@@ -199,11 +231,17 @@ class SoapyAdapter(RadioAdapter):
         iq = iq * np.exp(1j * ph)
         self._nco_phase = (ph[-1] + 2.0 * np.pi * (-f_off) / self.samp_rate) % (2.0 * np.pi)
 
-        # 2) anti-alias low-pass (complex FIR with overlap state), then decimate
-        x = np.concatenate([self._lpf_state, iq])
-        filt = np.convolve(x, self._lpf, mode="valid")  # len == len(iq)
-        self._lpf_state = iq[-(len(self._lpf) - 1):]
-        base = filt[::self._decim][:n_samples]
+        # 2) STAGED anti-alias + decimate (cheap: taps run at ever-lower rates)
+        sig = iq
+        for fir in self._stage_firs:
+            taps, state, M = fir
+            x = np.concatenate([state, sig])
+            y = np.convolve(x, taps, mode="valid")       # len == len(sig)
+            fir[1] = sig[-(len(taps) - 1):]              # save overlap state
+            sig = y[::M]
+        base = sig[:n_samples]
+        if len(base) < n_samples:                        # pad a short tail block
+            base = np.concatenate([base, np.zeros(n_samples - len(base), dtype=base.dtype)])
 
         # 3) SSB demod: USB = real part of the (already lowpassed) baseband; for LSB
         #    conjugate first (mirrors the sideband). Real part recovers the audio.
@@ -213,6 +251,11 @@ class SoapyAdapter(RadioAdapter):
             audio = np.real(base)
 
         audio = audio * self._audio_gain
+        # simple AGC: track signal level, scale toward target (fast attack, slow release)
+        rms = float(np.sqrt(np.mean(audio * audio)) + 1e-9)
+        a = 0.3 if rms > self._agc_level else 0.02
+        self._agc_level = (1 - a) * self._agc_level + a * rms
+        audio = audio * (self._agc_target / max(self._agc_level, 1e-4))
         np.clip(audio, -1.0, 1.0, out=audio)
         return audio.tolist()
 

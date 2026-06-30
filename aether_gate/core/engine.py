@@ -1142,10 +1142,16 @@ class Radio:
         sl = self.slices.get(self.active_slice)
         if sl:
             self.slice_freq, self.slice_mode = sl["freq"], sl["mode"]
-            self.center_mhz = self.slice_freq              # active slice drives the pan/waterfall centre
-            if self.adapter is not None:                   # Aether-gate: a real radio follows AE's tuning
+            # NB do NOT move the pan/hardware centre to the slice. AE tunes with autopan=0
+            # (slice moves WITHIN a fixed pan), so the panadapter centre stays put and the
+            # demod tunes in software inside the existing IQ window. The adapter decides
+            # whether the slice has left its RF window and needs a real hardware retune.
+            if self.adapter is not None:                   # Aether-gate: tell the adapter the slice freq
                 try:
-                    self.adapter.retune(self.slice_freq * 1e6)
+                    if hasattr(self.adapter, "set_slice"):
+                        self.adapter.set_slice(self.slice_freq * 1e6)   # demod target (software tune)
+                    else:
+                        self.adapter.retune(self.slice_freq * 1e6)      # fallback: legacy behaviour
                     if hasattr(self.adapter, "set_mode"):
                         self.adapter.set_mode(self.slice_mode)
                 except Exception as e:                      # an adapter fault must not kill the control thread
@@ -1328,7 +1334,11 @@ class Radio:
                 # arms RADE after remote_audio_rx already started this loop, this switches the
                 # running loop onto the dax stream without recreating it.
                 dax_on   = self.dax_channel is not None
-                reduced  = False if dax_on else self.audio_reduced_bw
+                # remote_audio_rx (the speaker path) always goes full-BW stereo float32 — AE's
+                # AudioEngine playback expects "one native 24 kHz stereo source" (AudioEngine.cpp).
+                # send_reduced_bw_dax governs DAX streams, NOT the RX speaker audio, so don't let
+                # it drop us to mono int16 here or the demod audio won't reach the output.
+                reduced  = False
                 stream_id = self.audio_stream_id
                 route = (f"dax_rx ch{self.dax_channel} (full-BW f32)" if dax_on
                          else f"remote_audio_rx ({'mono int16' if reduced else 'stereo f32'})")

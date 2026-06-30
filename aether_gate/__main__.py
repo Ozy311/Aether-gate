@@ -51,7 +51,7 @@ def main(argv=None):
     # soapy adapter options
     ap.add_argument("--soapy-driver", default="rtlsdr", help="soapy adapter: SoapySDR driver (rtlsdr/airspy/sdrplay/...)")
     ap.add_argument("--soapy-args", default="", help="soapy adapter: extra device args, comma kv (e.g. serial=00000001)")
-    ap.add_argument("--samp-rate", type=float, default=2_048_000, help="soapy adapter: sample rate (Hz)")
+    ap.add_argument("--samp-rate", type=float, default=2_040_000, help="soapy adapter: sample rate (Hz)")
     ap.add_argument("--gain", type=float, default=40.0, help="soapy adapter: RX gain dB (ignored if --agc)")
     ap.add_argument("--agc", action="store_true", help="soapy adapter: enable hardware AGC")
     ap.add_argument("--direct-samp", default=None, help="soapy adapter: RTL direct-sampling mode (Q=2 for HF on non-V4)")
