@@ -1,0 +1,79 @@
+#
+# Aether-gate — CLI entry point.
+# Copyright (C) 2026 Nigel Fenton (G0JKN). GPL-3.0-or-later.
+#
+"""Run Aether-gate with a chosen adapter:
+
+    python -m aether_gate --adapter sim --pattern test_card
+    python -m aether_gate --adapter sim --model FLEX-6700 --ae 10.0.0.107
+
+The core threads (discovery, UDP prime, control TCP serve) are wired exactly as
+flex-sim wires them; only the signal source is swapped for the adapter.
+"""
+import argparse
+import threading
+import time
+
+from .core.engine import (Radio, BINS, FPS, SIGNAL_WIDTH_KHZ, DEFAULT_PORT,
+                           DISCOVERY_PORT, local_ip, log, start_control_server)
+from .adapters import get_adapter, available
+
+
+def build_adapter(name, args):
+    cls = get_adapter(name)
+    if name == "sim":
+        return cls(pattern=args.pattern, model=args.model)
+    # Generic construction for future adapters; they parse their own --adapter-opt later.
+    return cls()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="aether_gate",
+                                 description="Universal radio bridge - presents any radio to AetherSDR as a Flex 6000.")
+    ap.add_argument("--adapter", default="sim", choices=available(),
+                    help="signal source adapter (default: sim)")
+    ap.add_argument("--pattern", default="carrier",
+                    help="sim adapter: test pattern (e.g. test_card, carrier, two_tone)")
+    ap.add_argument("--model", default="FLEX-6600",
+                    help="advertised radio model (drives slice cap)")
+    ap.add_argument("--ip", default=None, help="our IP (default: autodetect)")
+    ap.add_argument("--ae", default=None, help="AE IP to unicast discovery to (optional)")
+    ap.add_argument("--bins", type=int, default=BINS)
+    ap.add_argument("--fps", type=int, default=FPS)
+    ap.add_argument("--width-khz", type=float, default=SIGNAL_WIDTH_KHZ)
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT,
+                    help="control/data port to bind+advertise (default 4992; set e.g. 5992 to coexist with AE on one host)")
+    ap.add_argument("--ctl-port", type=int, default=8731, help="web control-panel port (0 to disable)")
+    args = ap.parse_args(argv)
+
+    ip = args.ip or local_ip()
+    adapter = build_adapter(args.adapter, args)
+    adapter.open()
+
+    radio = Radio(ip, args.ae, args.pattern, args.bins, args.fps, args.width_khz,
+                  port=args.port, model=args.model, adapter=adapter)
+    threading.Thread(target=radio.discovery_loop, daemon=True).start()
+    threading.Thread(target=radio.prime_loop, daemon=True).start()
+    if args.ctl_port:
+        start_control_server(radio, args.ctl_port)
+
+    log(f"aether-gate - adapter={args.adapter} provides={adapter.provides} "
+        f"model={radio.model} serial={radio.serial} ip={ip}")
+    log(f"discovery -> AE's UDP :{DISCOVERY_PORT}; control/data on :{args.port}"
+        + ("  (same-host mode)" if args.port != DISCOVERY_PORT else ""))
+    if args.ctl_port:
+        log(f"** control panel: http://{ip}:{args.ctl_port}/ **")
+    try:
+        radio.serve()
+    except KeyboardInterrupt:
+        radio.run = False
+        log("bye")
+    finally:
+        try:
+            adapter.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
