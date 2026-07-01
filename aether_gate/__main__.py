@@ -23,7 +23,10 @@ from .adapters import get_adapter, available
 def build_adapter(name, args):
     cls = get_adapter(name)
     if name == "sim":
-        return cls(pattern=args.pattern, model=args.model)
+        # honour --station/--serial so AE labels it "Aether-gate", not "flex-sim"
+        station = args.station if args.station != "aether-gate 1" else "Aether-gate"
+        return cls(pattern=args.pattern, model=args.model,
+                   serial=args.serial, station=station)
     if name == "soapy":
         return cls(driver=args.soapy_driver, device_args=args.soapy_args,
                    samp_rate=args.samp_rate, gain_db=args.gain,

@@ -18,11 +18,14 @@ class SimAdapter(RadioAdapter):
 
     provides = "spectrum"
 
-    def __init__(self, pattern="carrier", model="FLEX-6600", serial=""):
+    def __init__(self, pattern="carrier", model="FLEX-6600", serial="", station=""):
         if pattern not in PATTERNS:
             raise ValueError(f"unknown pattern {pattern!r}; choose from {sorted(PATTERNS)}")
         self.pattern = pattern
-        self.capabilities = AdapterCaps(model=model, serial=serial, tx_capable=True)
+        # station -> AE's nickname (what the chooser/status bar shows); without it AE
+        # falls back to the vendored engine's default label ("flex-sim").
+        self.capabilities = AdapterCaps(model=model, serial=serial, station=station,
+                                        tx_capable=True)
 
     def get_spectrum(self, ctx, t):
         return PATTERNS[self.pattern](ctx, t)
