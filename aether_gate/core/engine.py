@@ -137,7 +137,14 @@ AUDIO_SRC_WAV   = "wav"     # WAV file playback (looped)
 
 
 def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
+    msg = " ".join(str(x) for x in (time.strftime("%H:%M:%S"), *a))
+    try:
+        print(msg, flush=True)
+    except UnicodeEncodeError:
+        # Windows consoles default to cp1252, which can't encode e.g. "->" (U+2192);
+        # a crash here would kill the calling thread (was taking out audio_loop
+        # mid-connect). Degrade to ASCII rather than die.
+        print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
 
 
 def local_ip():
