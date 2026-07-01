@@ -709,7 +709,7 @@ class Radio:
         # radio_id off the base constants below.
         self.radio_id = radio_id
         self.serial = f"FLEXSIM{radio_id:02d}"
-        self.station = "flex-sim"                       # name AE displays; legacy default
+        self.station = "Aether-gate"                    # name AE displays (default nickname)
         if adapter is not None and getattr(adapter, "capabilities", None) is not None:
             if adapter.capabilities.serial:
                 self.serial = adapter.capabilities.serial   # distinct serial in AE's chooser
@@ -1718,11 +1718,11 @@ def live_test_set(paused=None, abort=False):
 
 
 # ---- live control panel (web UI served by the sim; drive from the host browser) ----
-CONTROL_HTML = """<!DOCTYPE html><html><head><meta charset=utf-8><title>flex-sim control</title>
+CONTROL_HTML = """<!DOCTYPE html><html><head><meta charset=utf-8><title>Aether-gate signal control</title>
 <style>body{{font-family:sans-serif;background:#111;color:#ddd;padding:18px;max-width:440px}}
 h2{{color:#5cf}} label{{display:block;margin:16px 0 4px}} select,input[type=range]{{width:380px}}
 .v{{color:#5cf;font-weight:bold}}</style></head><body>
-<h2>flex-sim &mdash; live control</h2>
+<h2>Aether-gate &mdash; signal control</h2>
 <div id=statusbar style="display:flex;align-items:center;gap:12px;background:#15202b;border:1px solid #243;border-radius:6px;padding:10px 12px;margin:0 0 14px">
   <button id=gobtn onclick="togglePause()" style="font-size:15px;font-weight:bold;padding:7px 16px;border:none;border-radius:5px;cursor:pointer;background:#c33;color:#fff">&#9632; Stop</button>
   <div style="line-height:1.4">
