@@ -226,6 +226,22 @@ class Icom9700Adapter(RadioAdapter):
         self._civ = _Ic9700Stream(lip, self.radio_ip, self._handler.civ_port,
                                   self._handler._civ_sock, self.civ_addr)
         self._civ.start()
+        # The CIV bring-up burst can race the stream handshake and the radio
+        # then stays silent forever (seen repeatedly 2026-07-01: deaf gate —
+        # no scope frames, no freq, no meters). SDR9700 documents this exact
+        # race and re-fires its enable set every second until data flows; do
+        # the same, and refuse to open() a deaf gate.
+        end = time.monotonic() + 12.0
+        while time.monotonic() < end and self._civ.frames == 0:
+            time.sleep(1.0)
+            if self._civ.frames == 0:
+                print("[civ] no scope data yet - re-firing bring-up", flush=True)
+                self._civ._on_iamready()
+        if self._civ.frames == 0:
+            self.close()
+            raise RuntimeError("IC-9700 CIV stream never produced data "
+                               "(radio session stale? wait ~40s and retry)")
+        print(f"[civ] stream healthy ({self._civ.frames} scope frames)", flush=True)
 
     def close(self):
         for obj in (self._civ, self._handler):
