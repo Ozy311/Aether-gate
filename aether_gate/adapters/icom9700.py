@@ -64,8 +64,18 @@ class _Ic9700Stream(Ic9700Civ):
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.on_data = self._dispatch
-        self.freq_hz = None
-        self.mode = None
+        # ONE coherent view of the radio, all sourced from the SELECTED VFO
+        # (25 00 freq, 26 00 mode). The old code seeded from 03 (MAIN) but
+        # tuned/polled via 25 00 (SELECTED) — when MAIN and SUB sit on
+        # different bands (esp. 23cm after a main/sub swap) those are
+        # DIFFERENT receivers, so the gate read one and drove the other and
+        # fine-tune fell apart. Proven on HW 2026-07-02 (dev/ic9700_state):
+        # 03 and 25 00 diverge constantly; 25 00/25 01/26 00 all read every
+        # band (incl 23cm) correctly. So: SELECTED VFO is the single source
+        # of truth for what AE sees and what we tune.
+        self.freq_hz = None            # SELECTED vfo freq (25 00) — the authority
+        self.mode = None               # SELECTED vfo mode (26 00)
+        self.other_freq_hz = None      # UNSELECTED vfo freq (25 01) — for dual-slice later
         self.smeter_raw = None         # last CI-V 15 02 reading, 0..255
         self._tune_target = None       # latest AE-requested freq (tuner thread chases it)
         self._tune_evt = threading.Event()
@@ -80,8 +90,13 @@ class _Ic9700Stream(Ic9700Civ):
         self.enable_scope()
         self.set_speed(0)
         self.set_span(500_000)
-        self._send_civ(bytes([0x03]))
-        self._send_civ(bytes([0x04]))
+        # Seed from the SELECTED VFO (25 00 freq + 26 00 mode), NOT 03/04:
+        # 03/04 read MAIN, but we tune the SELECTED vfo — seeding from a
+        # different receiver than we drive is the 23cm mismatch bug. Also
+        # read the OTHER vfo (25 01) for the future dual-slice model.
+        self._send_civ(bytes([0x25, 0x00]))
+        self._send_civ(bytes([0x25, 0x01]))
+        self._send_civ(bytes([0x26, 0x00]))
 
     def _dispatch(self, d):
         if d.find(b"\x27\x00\x00") >= 0:        # scope waveform frame
@@ -98,14 +113,23 @@ class _Ic9700Stream(Ic9700Civ):
             f = d[i:end + 1]
             if len(f) >= 6 and f[2] in (CONTROLLER_CIV, 0x00):
                 cmd, data = f[4], f[5:-1]
-                if cmd in (0x00, 0x03) and len(data) >= 5:
-                    # 03 = freq reply; 00 = freq transceive (dial turned)
+                # freq_hz + mode ALWAYS track the SELECTED VFO (25 00 / 26 00),
+                # never MAIN-only 03/04 — see the state-model note in __init__.
+                if cmd == 0x00 and len(data) >= 5:
+                    # 00 = freq transceive broadcast; on the 9700 it reflects
+                    # the operated (selected) VFO, so it's a valid selected read
                     self.freq_hz = _decode_bcd(data[:5])
-                elif cmd == 0x25 and len(data) >= 6 and data[0] == 0x00:
-                    self.freq_hz = _decode_bcd(data[1:6])   # selected-VFO read
-                elif cmd in (0x01, 0x04) and len(data) >= 1:
-                    # 04 = mode reply; 01 = mode transceive
+                elif cmd == 0x25 and len(data) >= 6:
+                    if data[0] == 0x00:
+                        self.freq_hz = _decode_bcd(data[1:6])       # SELECTED vfo
+                    elif data[0] == 0x01:
+                        self.other_freq_hz = _decode_bcd(data[1:6])  # OTHER vfo
+                elif cmd == 0x01 and len(data) >= 1:
+                    # 01 = mode transceive (selected vfo)
                     self.mode = CIV_TO_MODE.get(data[0])
+                elif cmd == 0x26 and len(data) >= 2 and data[0] == 0x00:
+                    # 26 00 = selected-vfo mode/data-mode read
+                    self.mode = CIV_TO_MODE.get(data[1])
                 elif cmd == 0x15 and len(data) >= 3 and data[0] == 0x02:
                     # S-meter reply: 15 02 <2-byte BCD 0000-0255>
                     self.smeter_raw = (data[1] >> 4) * 1000 + (data[1] & 0xF) * 100 + \
@@ -309,14 +333,15 @@ class Icom9700Adapter(RadioAdapter):
             self._civ.poll_smeter()
             self._smeter_sent_at = now
         if now - self._freq_polled_at >= 1.0:
-            # keep freq_hz fresh even when the rig's CI-V transceive is off,
-            # so the dial drives AE (see engine radio->AE sync).
-            # Poll the SELECTED-VFO freq (25 00), NOT plain 03: 03 reads MAIN
-            # only, so a band change that lands on the SUB receiver never
-            # moved freq_hz (2026-07-02: "changing to 440 on IC didn't change
-            # AE"). 25 00 tracks whichever receiver is selected, matching how
-            # we tune (set_freq_hz uses 25 00 too).
+            # keep the SELECTED-VFO freq + mode fresh even when the rig's CI-V
+            # transceive is off, so the dial (and band changes) drive AE.
+            # 25 00 = selected freq (the authority; 03 reads MAIN only and
+            # diverges from what we tune), 26 00 = selected mode (fixes the
+            # stale-mode issue: showed DIGU while the rig was FM). 25 01 =
+            # other vfo, kept fresh for the future dual-slice model.
             self._civ._send_civ(bytes([0x25, 0x00]))
+            self._civ._send_civ(bytes([0x26, 0x00]))
+            self._civ._send_civ(bytes([0x25, 0x01]))
             self._freq_polled_at = now
         raw = self._civ.smeter_raw
         if raw is None:
