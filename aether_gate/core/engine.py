@@ -945,7 +945,12 @@ class Radio:
                 self.audio_reduced_bw = False
             self.reply(conn, seq)
         elif c == "slice list":
-            self.reply(conn, seq, "")
+            # Report existing slice indices so AE discovers gate-originated
+            # slices (the SUB receiver's slice 1) it didn't create itself.
+            # AE instantiates a SliceModel per index here; without this a
+            # status-pushed SUB slice is never rendered (AE only knows slices
+            # it created or discovered via slice list).
+            self.reply(conn, seq, " ".join(str(i) for i in sorted(self.slices)))
         elif c.startswith("display panafall create") or c.startswith("display pan create"):
             pid = self._new_pan()                          # AE's +RX = a NEW stacked panadapter
             self.reply(conn, seq, f"0x{pid:08X},0x{self.pans[pid]['wf_id']:08X}")
