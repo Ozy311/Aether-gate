@@ -226,22 +226,27 @@ class Icom9700Adapter(RadioAdapter):
         self._civ = _Ic9700Stream(lip, self.radio_ip, self._handler.civ_port,
                                   self._handler._civ_sock, self.civ_addr)
         self._civ.start()
-        # The CIV bring-up burst can race the stream handshake and the radio
-        # then stays silent forever (seen repeatedly 2026-07-01: deaf gate —
-        # no scope frames, no freq, no meters). SDR9700 documents this exact
-        # race and re-fires its enable set every second until data flows; do
-        # the same, and refuse to open() a deaf gate.
+        # The CIV bring-up can race the stream handshake, and a glitched
+        # session start can poison the tracked-seq layer: the radio then
+        # drops every packet WE send while its own streams keep flowing
+        # (scope frames arrive because the scope was left enabled by a
+        # previous session — so frames alone prove nothing). Health =
+        # a reply to OUR OWN freq read. SDR9700 retries its bring-up on a
+        # timer for the same reason; if replies never come, refuse to open
+        # — the caller/launcher retries after the radio's stale window.
         end = time.monotonic() + 12.0
-        while time.monotonic() < end and self._civ.frames == 0:
+        while time.monotonic() < end and self._civ.freq_hz is None:
             time.sleep(1.0)
-            if self._civ.frames == 0:
-                print("[civ] no scope data yet - re-firing bring-up", flush=True)
+            if self._civ.freq_hz is None:
+                print("[civ] no reply to our reads yet - re-firing bring-up", flush=True)
                 self._civ._on_iamready()
-        if self._civ.frames == 0:
+        if self._civ.freq_hz is None:
             self.close()
-            raise RuntimeError("IC-9700 CIV stream never produced data "
-                               "(radio session stale? wait ~40s and retry)")
-        print(f"[civ] stream healthy ({self._civ.frames} scope frames)", flush=True)
+            raise RuntimeError("IC-9700 accepted the session but ignores our "
+                               "commands (poisoned seq layer / stale session) - "
+                               "wait ~40s and retry")
+        print(f"[civ] stream healthy (freq={self._civ.freq_hz/1e6:.4f} MHz, "
+              f"{self._civ.frames} scope frames)", flush=True)
 
     def close(self):
         for obj in (self._civ, self._handler):
