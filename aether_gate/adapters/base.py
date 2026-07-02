@@ -67,6 +67,10 @@ class RadioAdapter(ABC):
     def set_mode(self, mode: str):
         """AE changed mode (USB/LSB/CW/...). Override for HW that cares."""
 
+    def set_span(self, span_hz: float):
+        """AE's pan zoom changed (full width, Hz). Optional: adapters whose
+        source has a native span (a rig's band scope) can follow it."""
+
     # --- readback (radio -> AE) -----------------------------------------
     def read_meters(self) -> Meters:
         """Optional S-meter / TX state. Default: quiet RX."""

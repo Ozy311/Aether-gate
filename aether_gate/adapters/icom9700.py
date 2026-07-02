@@ -7,15 +7,19 @@
 
 Pipeline: handler.py authenticates + opens the CI-V stream; civ.py subscribes to
 the band scope (CI-V 27h) and exposes latest_dbm. This adapter:
-  * get_spectrum(ctx,t) -> resamples the latest scope sweep to ctx.n dBm bins
-    (flat noise floor until the radio's scope produces non-zero pixels),
-  * retune(center_hz)   -> CI-V set-frequency (cmd 05) so AE's tuning moves the rig,
-  * set_mode(mode)      -> CI-V set-mode (cmd 06).
+  * get_spectrum(ctx,t) -> resamples the latest scope sweep to ctx.n dBm bins,
+  * retune(center_hz)   -> CI-V set-frequency (cmd 05) so AE's tuning moves the rig
+    (in-band only: the 9700 FAs out-of-ham-band freq sets),
+  * set_mode(mode)      -> CI-V set-mode (cmd 06),
+  * set_span(span_hz)   -> AE pan zoom follows onto the rig's scope span,
+  * read_meters()       -> S-meter (CI-V 15 02, VHF S9 = -93 dBm mapping).
 
-Control (read freq/mode + set freq) is proven end-to-end; the scope-pixel question
-is a radio-side setting, independent of this wiring (see project memory).
+Scope path live-proven 2026-07-01 (HT key-up on 146.52: raw 53 at RF-gain 0, pegged
+at gain max). NB the waveform floor is -130 dBm/pixel and the 9700 SCALES scope
+data by RF gain — a quiet band with gain low legitimately reads all-zero.
 """
 import threading
+import time
 
 from ..core.engine import local_ip as _local_ip
 from .base import RadioAdapter, AdapterCaps, Meters
@@ -62,11 +66,17 @@ class _Ic9700Stream(Ic9700Civ):
         self.on_data = self._dispatch
         self.freq_hz = None
         self.mode = None
+        self.smeter_raw = None         # last CI-V 15 02 reading, 0..255
 
     def _on_iamready(self):
-        # open the data stream, enable the scope, and read current freq+mode
+        # open the data stream, enable the scope (on + output + MAIN), then
+        # FAST sweep (radio was found on SLOW = ~4 waveform frames/s) and a
+        # known ±500 kHz span so the advertised pan axis starts truthful;
+        # finally read current freq+mode
         self._send_openclose(opening=True)
         self.enable_scope()
+        self.set_speed(0)
+        self.set_span(500_000)
         self._send_civ(bytes([0x03]))
         self._send_civ(bytes([0x04]))
 
@@ -87,6 +97,10 @@ class _Ic9700Stream(Ic9700Civ):
                     self.freq_hz = _decode_bcd(data[:5])
                 elif cmd == 0x04 and len(data) >= 1:
                     self.mode = CIV_TO_MODE.get(data[0])
+                elif cmd == 0x15 and len(data) >= 3 and data[0] == 0x02:
+                    # S-meter reply: 15 02 <2-byte BCD 0000-0255>
+                    self.smeter_raw = (data[1] >> 4) * 1000 + (data[1] & 0xF) * 100 + \
+                                      (data[2] >> 4) * 10 + (data[2] & 0xF)
             i = d.find(b"\xfe\xfe", end)
 
     def set_freq_hz(self, hz):
@@ -94,6 +108,9 @@ class _Ic9700Stream(Ic9700Civ):
 
     def set_mode_civ(self, mode_byte, filt=0x01):
         self._send_civ(bytes([0x06, mode_byte, filt]))
+
+    def poll_smeter(self):
+        self._send_civ(bytes([0x15, 0x02]))
 
 
 class Icom9700Adapter(RadioAdapter):
@@ -113,11 +130,16 @@ class Icom9700Adapter(RadioAdapter):
         self.local_ip = local_ip
         self.radio_port = radio_port
         self.civ_addr = civ_addr
-        # IC-9700 covers 2m/70cm/23cm; RX-only here (no TX/PTT wired -> never keys the rig)
+        # IC-9700 covers 2m/70cm/23cm; RX-only here (no TX/PTT wired -> never keys the rig).
+        # Span honesty: the 9700 scope does ±2.5k..±500k -> pan width 5 kHz..1 MHz;
+        # don't let AE zoom the axis past what the scope can actually show.
         self.capabilities = AdapterCaps(model=model, serial=serial, station=station,
-                                        tx_capable=False)
+                                        tx_capable=False,
+                                        min_span_hz=5_000.0, max_span_hz=1_000_000.0)
         self._handler = None
         self._civ = None
+        self._span_half_hz = 500_000      # what the scope is set to (± half-width)
+        self._span_sent_at = 0.0
 
     def open(self):
         lip = self.local_ip or _local_ip()
@@ -149,6 +171,19 @@ class Icom9700Adapter(RadioAdapter):
         if mb is not None and self._civ:
             self._civ.set_mode_civ(mb)
 
+    def set_span(self, span_hz):
+        """Follow AE's pan zoom: full width -> nearest Icom ± half-width setting."""
+        if not self._civ:
+            return
+        half = span_hz / 2.0
+        want = min(Ic9700Civ.SPANS_HZ, key=lambda s: abs(s - half))
+        now = time.monotonic()
+        if want == self._span_half_hz or now - self._span_sent_at < 0.5:
+            return                          # unchanged, or rate-limit zoom drags
+        self._civ.set_span(want)
+        self._span_half_hz = want
+        self._span_sent_at = now
+
     # --- spectrum (radio -> AE) ----------------------------------------
     def get_spectrum(self, ctx, t):
         dbm = self._civ.latest_dbm if self._civ else None
@@ -157,4 +192,18 @@ class Icom9700Adapter(RadioAdapter):
         return _resample(dbm, ctx.n)
 
     def read_meters(self):
-        return Meters()                          # TODO: S-meter via CI-V 15 02
+        # Async poll: send the read now, return the last parsed value (one
+        # frame behind — fine for a meter; SDR9700 polls 15 02 at 10 Hz too).
+        if not self._civ:
+            return Meters()
+        self._civ.poll_smeter()
+        raw = self._civ.smeter_raw
+        if raw is None:
+            return Meters()
+        # Icom S-meter: 0=S0, 120=S9, 241=S9+60dB. VHF convention S9 = -93 dBm
+        # (6 dB/S-unit -> S0 = -147), then linear dB above S9.
+        if raw <= 120:
+            dbm = -147.0 + raw * (54.0 / 120.0)
+        else:
+            dbm = -93.0 + (raw - 120) * (60.0 / 121.0)
+        return Meters(s_meter_dbm=dbm)

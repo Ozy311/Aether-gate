@@ -943,7 +943,13 @@ class Radio:
             if "y_pixels" in kvs: self.y_pixels = max(2, int(kvs["y_pixels"]))
             if "min_dbm" in kvs: self.min_dbm = float(kvs["min_dbm"])
             if "max_dbm" in kvs: self.max_dbm = float(kvs["max_dbm"])
-            if "bandwidth" in kvs: self.span_mhz = float(kvs["bandwidth"])
+            if "bandwidth" in kvs:
+                self.span_mhz = float(kvs["bandwidth"])
+                # Aether-gate seam: let a real-radio adapter follow AE's pan zoom
+                # (e.g. drive the rig's band-scope span). Optional; no-op in base.
+                if getattr(self, "adapter", None) is not None:
+                    try: self.adapter.set_span(self.span_mhz * 1e6)
+                    except Exception: pass
             # Retune THIS panadapter by absolute centre= or by band= (AE's band buttons).
             # Per-pan, not radio-global, so stacked pans can sit on different bands; move
             # the pan's slice with it (a band change retunes its receiver, like a real radio).

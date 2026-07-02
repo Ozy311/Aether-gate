@@ -106,7 +106,8 @@ class Ic9700Civ(UdpBase):
     SPANS_HZ = (2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000)
 
     def set_span(self, span_hz):
-        """Center-mode span in Hz (one of SPANS_HZ; the radio snaps otherwise)."""
+        """Center-mode span in Hz (one of SPANS_HZ; the radio snaps otherwise).
+        NB the wire/UI value is the ± half-width: 500_000 = "±500k" = 1 MHz shown."""
         hz = int(span_hz)
         bcd = bytearray()
         for _ in range(5):
@@ -114,6 +115,11 @@ class Ic9700Civ(UdpBase):
             hi = hz % 10; hz //= 10
             bcd.append((hi << 4) | lo)
         self._send_civ(bytes([0x27, 0x15, 0x00]) + bytes(bcd))
+
+    def set_speed(self, idx):
+        """Scope sweep speed: 0=FAST, 1=MID, 2=SLOW (27 1A). FAST ≈ better fps;
+        the radio was found on SLOW which caps waveform frames at ~4/s."""
+        self._send_civ(bytes([0x27, 0x1A, 0x00, idx & 0x03]))
 
     # --- packet builders ---------------------------------------------------
     def _send_openclose(self, opening):
