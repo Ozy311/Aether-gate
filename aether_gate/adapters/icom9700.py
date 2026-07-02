@@ -82,9 +82,10 @@ class _Ic9700Stream(Ic9700Civ):
 
     def _dispatch(self, d):
         if d.find(b"\x27\x00\x00") >= 0:        # scope waveform frame
-            self._on_civ(d)
-            return
-        # otherwise: control CI-V replies (03 freq, 04 mode, FB/FA ack)
+            self._on_civ(d)                     # (no early return: a datagram can
+                                                # carry control replies alongside)
+        # control CI-V replies (03 freq, 04 mode, 15 02 s-meter, FB/FA ack);
+        # the walker skips 27h frames naturally (no branch for them)
         i = d.find(b"\xfe\xfe")
         while i >= 0:
             end = d.find(b"\xfd", i)
