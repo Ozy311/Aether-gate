@@ -389,8 +389,21 @@ class Icom9700Adapter(RadioAdapter):
 
     # --- dual-receiver (SUB) — drives the second slice -------------------
     def sub_active(self):
-        """True when the rig's SUB receiver (dualwatch) is on -> AE gets a 2nd slice."""
-        return bool(self._civ and self._civ.dualwatch)
+        """True when the rig's SUB receiver is operating -> AE gets a 2nd slice.
+
+        Detected by the OTHER VFO (25 01) reading a DISTINCT, real ham freq —
+        NOT by the 07 D2 'dualwatch' flag. Proven on HW 2026-07-02: with 2m +
+        23cm both running, 07 D2 read False (Icom 'dualwatch' is the narrower
+        same-band watch, not general MAIN/SUB dual-receive), while 25 01
+        correctly read 1294.5 FM. The physical presence of a second receiver
+        on a real frequency is the reliable signal."""
+        if not self._civ:
+            return False
+        o = self._civ.other_freq_hz
+        s = self._civ.freq_hz
+        # a plausible ham freq on the other vfo, meaningfully different from
+        # the selected one (>1 kHz) = a live second receiver
+        return bool(o and o > 1_000_000 and (s is None or abs(o - s) > 1_000))
 
     def sub_freq_hz(self):
         return self._civ.other_freq_hz if self._civ else None
@@ -435,11 +448,12 @@ class Icom9700Adapter(RadioAdapter):
             self._diag_t, self._diag_n = now, civ.frames
 
         sel_dbm = self._smeter_dbm(civ.smeter_raw) if civ else None
+        sub_on = self.sub_active()
         vfos = []
         if civ:
             vfos.append({"name": "MAIN/SEL", "freq_hz": civ.freq_hz,
                          "mode": civ.mode, "selected": True})
-            if civ.dualwatch:
+            if sub_on:
                 vfos.append({"name": "SUB", "freq_hz": civ.other_freq_hz,
                              "mode": civ.other_mode, "selected": False})
         return {
@@ -457,7 +471,8 @@ class Icom9700Adapter(RadioAdapter):
                        "raw": (civ.smeter_raw if civ else None)},
             "scope": {"fps": fps, "bins": (len(civ.latest_dbm) if civ and civ.latest_dbm else None),
                       "total_frames": (civ.frames if civ else 0)},
-            "flags": {"dualwatch": bool(civ.dualwatch) if civ else False},
+            "flags": {"sub_receiver": sub_on,
+                      "dualwatch_reg": bool(civ.dualwatch) if civ else False},
             "counters": {"tune_ok": (civ.n_fb if civ else 0),
                          "tune_refused": (civ.n_fa if civ else 0)},
         }
