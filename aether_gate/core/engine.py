@@ -1267,14 +1267,18 @@ class Radio:
         if not sub_on:
             if sub is not None:                            # SUB off -> retire slice 1 + its pan
                 spid = sub.get("pan")
+                prim = self._primary_pan()
                 self.slices.pop(self.SUB_SLICE, None)
                 self.status(self.conn, f"slice {self.SUB_SLICE} in_use=0")
-                if spid is not None and spid != self._primary_pan():
+                if spid is not None and spid != prim:
                     swid = self.pans.get(spid, {}).get("wf_id")
                     self.pans.pop(spid, None)              # stop streaming the SUB pan
                     self.status(self.conn, f"display pan 0x{spid:08X} removed")
                     if swid is not None:
                         self.status(self.conn, f"display waterfall 0x{swid:08X} removed")
+                # if the SUB slice was the ACTIVE slice, hand active back to a survivor
+                if self.active_slice == self.SUB_SLICE and self.slices:
+                    self.active_slice = next(iter(self.slices))
                 log("[dual] SUB receiver off -> removed slice 1 + its pan")
             return
 
