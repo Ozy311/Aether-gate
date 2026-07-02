@@ -84,28 +84,53 @@ class _Ic9700Stream(Ic9700Civ):
         if d.find(b"\x27\x00\x00") >= 0:        # scope waveform frame
             self._on_civ(d)                     # (no early return: a datagram can
                                                 # carry control replies alongside)
-        # control CI-V replies (03 freq, 04 mode, 15 02 s-meter, FB/FA ack);
-        # the walker skips 27h frames naturally (no branch for them)
+        # control CI-V: replies to us (fe fe E0 a2 ...) AND transceive
+        # broadcasts (fe fe 00 a2 ...) the rig sends when its dial/mode is
+        # changed at the front panel — that's how the radio drives AE.
         i = d.find(b"\xfe\xfe")
         while i >= 0:
             end = d.find(b"\xfd", i)
             if end < 0:
                 break
             f = d[i:end + 1]
-            if len(f) >= 6 and f[2] == CONTROLLER_CIV:
+            if len(f) >= 6 and f[2] in (CONTROLLER_CIV, 0x00):
                 cmd, data = f[4], f[5:-1]
-                if cmd == 0x03 and len(data) >= 5:
+                if cmd in (0x00, 0x03) and len(data) >= 5:
+                    # 03 = freq reply; 00 = freq transceive (dial turned)
                     self.freq_hz = _decode_bcd(data[:5])
-                elif cmd == 0x04 and len(data) >= 1:
+                elif cmd == 0x25 and len(data) >= 6 and data[0] == 0x00:
+                    self.freq_hz = _decode_bcd(data[1:6])   # selected-VFO read
+                elif cmd in (0x01, 0x04) and len(data) >= 1:
+                    # 04 = mode reply; 01 = mode transceive
                     self.mode = CIV_TO_MODE.get(data[0])
                 elif cmd == 0x15 and len(data) >= 3 and data[0] == 0x02:
                     # S-meter reply: 15 02 <2-byte BCD 0000-0255>
                     self.smeter_raw = (data[1] >> 4) * 1000 + (data[1] & 0xF) * 100 + \
                                       (data[2] >> 4) * 10 + (data[2] & 0xF)
+                elif cmd == 0xFB:
+                    self.n_fb += 1
+                elif cmd == 0xFA:
+                    self.n_fa += 1
             i = d.find(b"\xfe\xfe", end)
 
+    def _try_freq(self, hz, settle=0.35):
+        """Selected-VFO tune (25 00). Returns False if the radio FA'd it."""
+        fa0 = self.n_fa
+        self._send_civ(bytes([0x25, 0x00]) + _encode_bcd(hz))
+        time.sleep(settle)
+        return self.n_fa == fa0
+
     def set_freq_hz(self, hz):
-        self._send_civ(bytes([0x05]) + _encode_bcd(hz))
+        # Cross-band recipe proven on HW 2026-07-01 (dev/ic9700_xband2):
+        # 25 00 tunes same-band and any UNHELD band; a band parked on the
+        # SUB receiver is refused (FA) — swap main/sub (07 B0) and retry.
+        if self._try_freq(hz):
+            self.freq_hz = int(hz)
+            return
+        self._send_civ(bytes([0x07, 0xB0]))     # swap main/sub
+        time.sleep(0.4)
+        if self._try_freq(hz):
+            self.freq_hz = int(hz)
 
     def set_mode_civ(self, mode_byte, filt=0x01):
         self._send_civ(bytes([0x06, mode_byte, filt]))
@@ -146,6 +171,7 @@ class Icom9700Adapter(RadioAdapter):
         self._span_half_hz = 500_000      # what the scope is set to (± half-width)
         self._span_sent_at = 0.0
         self._smeter_sent_at = 0.0        # rate-limit the 15 02 poll (10 Hz like SDR9700)
+        self._freq_polled_at = 0.0        # slow freq poll (dial-sync when transceive is off)
 
     def open(self):
         lip = self.local_ip or _local_ip()
@@ -207,6 +233,11 @@ class Icom9700Adapter(RadioAdapter):
         if now - self._smeter_sent_at >= 0.1:
             self._civ.poll_smeter()
             self._smeter_sent_at = now
+        if now - self._freq_polled_at >= 1.0:
+            # keep freq_hz fresh even when the rig's CI-V transceive is off,
+            # so the dial drives AE (see engine radio->AE sync)
+            self._civ._send_civ(bytes([0x03]))
+            self._freq_polled_at = now
         raw = self._civ.smeter_raw
         if raw is None:
             return None
@@ -230,4 +261,11 @@ class Icom9700Adapter(RadioAdapter):
         return None
 
     def initial_mode(self):
+        return self._civ.mode if self._civ else None
+
+    # --- radio -> AE (engine polls these each second) --------------------
+    def radio_freq_hz(self):
+        return self._civ.freq_hz if self._civ else None
+
+    def radio_mode(self):
         return self._civ.mode if self._civ else None

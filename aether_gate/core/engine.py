@@ -760,6 +760,8 @@ class Radio:
         self.noise_color = 0.0          # live (noise tilt: 0=white, >0=pink)
         self.noise_cal_full = True      # live: noise_cal full-span (standard) vs width-limited
         self.vita_dest = None
+        self._ae_drive_at = 0.0      # when AE last drove the tune (suppresses radio->AE echo)
+        self._radio_sync_at = 0.0    # last radio->AE dial-sync check
         self.run = True
         self.send_lock = threading.Lock()   # serialize TCP writes: stream thread (status) vs command thread (replies)
         self.streaming = False
@@ -1216,6 +1218,7 @@ class Radio:
             # whether the slice has left its RF window and needs a real hardware retune.
             if self.adapter is not None:                   # Aether-gate: tell the adapter the slice freq
                 try:
+                    self._ae_drive_at = time.time()          # AE is driving: hold radio->AE sync off briefly
                     if hasattr(self.adapter, "set_slice"):
                         self.adapter.set_slice(self.slice_freq * 1e6)   # demod target (software tune)
                     else:
@@ -1569,6 +1572,38 @@ class Radio:
                     log("[stream] send error:", e); break
                 fi += 1
                 last_tc = tc
+            # Aether-gate seam: radio -> AE dial sync. If the rig was tuned at
+            # its front panel (CI-V transceive or the adapter's slow poll), the
+            # active slice + its pan follow, and AE is told via status. Held
+            # off for 2 s after AE itself drives a tune so a slow cross-band
+            # retune doesn't ping-pong.
+            if (self.adapter is not None and self.conn is not None
+                    and time.time() - self._radio_sync_at > 1.0
+                    and time.time() - self._ae_drive_at > 2.0):
+                self._radio_sync_at = time.time()
+                try:
+                    rf = getattr(self.adapter, "radio_freq_hz", lambda: None)()
+                    sl = self.slices.get(self.active_slice)
+                    if rf and sl and abs(sl["freq"] * 1e6 - rf) > 5.0:
+                        rmhz = rf / 1e6
+                        sl["freq"] = rmhz
+                        self.slice_freq = rmhz
+                        rmode = getattr(self.adapter, "radio_mode", lambda: None)()
+                        if rmode in ("LSB", "USB", "AM", "CW", "FM", "RTTY"):
+                            sl["mode"] = rmode
+                            self.slice_mode = rmode
+                        pid = sl.get("pan") or self._primary_pan()
+                        pan = self.pans.get(pid)
+                        if pan is not None:
+                            pan["center"] = rmhz
+                        self.emit_slice_status(self.conn, self.active_slice)
+                        if pid is not None:
+                            self.emit_pan_status(self.conn, pid)
+                        log(f"[radio->ae] rig dial moved: slice {self.active_slice} "
+                            f"-> {rmhz:.5f} MHz {sl['mode']}")
+                except Exception:
+                    pass   # dial sync must never kill the stream thread
+
             # TX meters every frame: real power/SWR while keyed, ~0 W / 1.0 SWR when not,
             # so AE's meter decays back to zero on de-key. CW/CWX key power per element.
             pw = self.tx_power_w if keyed else 0.0
