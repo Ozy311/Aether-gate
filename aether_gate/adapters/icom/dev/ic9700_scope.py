@@ -20,6 +20,8 @@ print(f"  civ_port={h.civ_port} audio_port={h.audio_port} token=0x{h.token:08x}"
 civ = Ic9700Civ(LIP, RIP, h.civ_port, h._civ_sock, CIV_ADDR)
 print(f"opening CI-V stream (civ_addr=0x{CIV_ADDR:02x})...")
 civ.start()
+time.sleep(1.0)
+civ.set_span(500_000)   # ±500 kHz — widest view, most likely to catch real signals
 
 deadline = time.time() + 13
 resent = 0
@@ -32,6 +34,10 @@ while time.time() < deadline:
     time.sleep(0.25)
 
 print(f"  scope frames received: {civ.frames}")
+print(f"  datagram length histogram: {dict(sorted(civ.dgram_lens.items()))}")
+for i, (ln, s) in enumerate(civ.samples):
+    body = s if ln < 400 else s[:120] + "..." + s[-8:]
+    print(f"  --- sample {i} (len {ln}): {body}")
 print(f"  PEAK raw byte across all frames: {civ.max_byte} "
       f"(dBm peak ~ {(-130 + min(civ.max_byte,159)/159*120):.1f})")
 if civ.bounds_raw:

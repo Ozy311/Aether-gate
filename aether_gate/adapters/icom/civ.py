@@ -82,6 +82,10 @@ class Ic9700Civ(UdpBase):
         self.bounds_raw = None         # the 12 mode/bounds bytes (start/end freq etc.)
         self.max_byte = 0              # peak raw scope byte seen across all frames
         self.best_raw = None           # hex of the frame with the highest peak
+        self.dgram_lens = {}           # diagnostic: {datagram_len: count}
+        self.samples = []              # diagnostic: full hex of first few payload datagrams
+        self.n_fb = 0                  # diagnostic: OK replies seen
+        self.n_fa = 0                  # diagnostic: NG (rejected) replies seen
 
     # --- discovery hook: stream is ready, open it + enable the scope --------
     def _on_iamready(self):
@@ -89,8 +93,27 @@ class Ic9700Civ(UdpBase):
         self.enable_scope()
 
     def enable_scope(self):
+        # Full bring-up per SDR9700 RadioBackend::sendScopeEnable (it retries
+        # this set until waveform data actually flows): on + output + MAIN.
+        # Without 27 12 00 the radio can sit on the SUB scope and stream
+        # all-zero main-scope frames.
         self._send_civ(bytes([0x27, 0x10, 0x01]))   # scope ON
         self._send_civ(bytes([0x27, 0x11, 0x01]))   # scope data output -> CI-V ON
+        self._send_civ(bytes([0x27, 0x12, 0x00]))   # scope select = MAIN
+
+    # IC-9700 center-mode spans, Hz (the radio wants the BCD frequency form on
+    # the wire — the index form 27 15 00 <idx> is ACKed FB but ignored)
+    SPANS_HZ = (2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000)
+
+    def set_span(self, span_hz):
+        """Center-mode span in Hz (one of SPANS_HZ; the radio snaps otherwise)."""
+        hz = int(span_hz)
+        bcd = bytearray()
+        for _ in range(5):
+            lo = hz % 10; hz //= 10
+            hi = hz % 10; hz //= 10
+            bcd.append((hi << 4) | lo)
+        self._send_civ(bytes([0x27, 0x15, 0x00]) + bytes(bcd))
 
     # --- packet builders ---------------------------------------------------
     def _send_openclose(self, opening):
@@ -115,6 +138,17 @@ class Ic9700Civ(UdpBase):
 
     # --- scope frame parse -------------------------------------------------
     def _on_civ(self, d):
+        # diagnostics: tally datagram sizes + keep the first couple of samples
+        # of EVERY size bucket (short ones = CI-V echoes + FB/FA replies to our
+        # scope-enable commands — an FA there means the radio rejected them)
+        self.dgram_lens[len(d)] = self.dgram_lens.get(len(d), 0) + 1
+        if self.dgram_lens[len(d)] <= 2:
+            self.samples.append((len(d), d.hex()))
+        to_us = bytes([0xFE, 0xFE, CONTROLLER_CIV, self.civ_addr])
+        if d.find(to_us + b"\xfb") >= 0:
+            self.n_fb += 1
+        if d.find(to_us + b"\xfa") >= 0:
+            self.n_fa += 1
         m = d.find(b"\x27\x00\x00")
         if m < 0:
             return
