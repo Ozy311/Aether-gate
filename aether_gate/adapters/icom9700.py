@@ -290,6 +290,33 @@ class Icom9700Adapter(RadioAdapter):
             except Exception:
                 pass
 
+    def needs_reconnect(self):
+        """True when the deaf-session watchdog wants a full CI-V reconnect."""
+        return bool(getattr(self, "_want_reconnect", False))
+
+    def reconnect(self):
+        """Tear down + re-establish the CI-V session after it went deaf mid-run.
+        The radio needs its ~15-25 s stale window to clear, so retry patiently.
+        Called by the engine off the stream/poll thread (open() blocks)."""
+        print("[civ] reconnecting the radio session...", flush=True)
+        self._want_reconnect = False
+        try:
+            self.close()
+        except Exception:
+            pass
+        self._civ = self._handler = None
+        for attempt in range(4):
+            time.sleep(18.0)                               # let the radio's stale session age out
+            try:
+                self.open()                                # re-auth + civ + health gate
+                self._wd_freq_t = time.monotonic()         # reset the watchdog clock
+                print("[civ] reconnect OK", flush=True)
+                return True
+            except Exception as e:
+                print(f"[civ] reconnect attempt {attempt+1} failed: {e}", flush=True)
+        print("[civ] reconnect gave up after 4 tries", flush=True)
+        return False
+
     # The rig's real coverage; AE can ask for anything (e.g. its restored
     # 40m profile at connect) — chasing an out-of-range target just earns
     # an FA from the radio, so drop it here and let the radio->AE dial
@@ -354,15 +381,29 @@ class Icom9700Adapter(RadioAdapter):
             self._civ._send_civ(bytes([0x25, 0x01]))    # SUB freq
             self._civ._send_civ(bytes([0x26, 0x01]))    # SUB mode
             self._civ._send_civ(bytes([0x07, 0xD2]))    # dualwatch on/off
-            # SCOPE WATCHDOG: rig band/VFO changes can silently drop the scope
-            # stream (frames stop -> AE's waterfall freezes though the control
-            # plane stays alive). If no new scope frames arrived since last tick,
-            # re-fire the scope-enable set (SDR9700 does the same on a timer).
+            # TWO-TIER WATCHDOG for a stalled CI-V session (heavy band/VFO
+            # fiddling can wedge the RS-BA1 session mid-run):
+            #  (1) scope frames stopped but reads still fresh -> just the scope
+            #      dropped; re-fire enable_scope (SDR9700 does the same).
+            #  (2) FREQ reads ALSO frozen for ~6 s despite re-enables -> the
+            #      whole session has gone DEAF; a scope re-enable can't wake it,
+            #      so flag for a full reconnect (close+open) — done off the poll
+            #      thread by the engine via needs_reconnect().
             frames = self._civ.frames
-            if frames == getattr(self, "_scope_frames_last", -1):
-                self._civ.enable_scope()
-                print("[scope] stream stalled -> re-enabling", flush=True)
+            scope_stalled = (frames == getattr(self, "_scope_frames_last", -1))
             self._scope_frames_last = frames
+            fz = self._civ.freq_hz
+            if fz != getattr(self, "_wd_freq_last", None):
+                self._wd_freq_last = fz
+                self._wd_freq_t = now                      # reads are advancing
+            reads_frozen_for = now - getattr(self, "_wd_freq_t", now)
+            if scope_stalled and reads_frozen_for < 5.0:
+                self._civ.enable_scope()                   # tier 1: nudge the scope
+                print("[scope] stream stalled -> re-enabling", flush=True)
+            elif reads_frozen_for >= 6.0 and not getattr(self, "_want_reconnect", False):
+                self._want_reconnect = True                # tier 2: session deaf -> reconnect
+                print(f"[civ] session deaf {reads_frozen_for:.0f}s "
+                      f"(reads frozen) -> requesting reconnect", flush=True)
             self._freq_polled_at = now
         raw = self._civ.smeter_raw
         if raw is None:

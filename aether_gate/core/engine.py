@@ -1250,11 +1250,14 @@ class Radio:
     SUB_SLICE = 1
 
     def _sync_sub_slice(self):
-        """Mirror the rig's SUB receiver (if active) as slice 1 on the primary's
-        pan. Read-only (Stage 1): freq/mode follow the radio; created when the
-        rig's dualwatch turns on, removed when it turns off. Both slices land on
-        ONE pan so AE renders them as two flags on a single waterfall (the
-        selected receiver's — the 9700 only streams one scope over LAN)."""
+        """Mirror the rig's SUB receiver (if active) as slice 1 on its OWN
+        stacked panadapter (Stage A). freq/mode follow the radio; the SUB pan +
+        slice are created when the SUB receiver comes on and removed when it
+        goes off. Two STACKED pans (one per receiver, each framed on its own
+        band) — but only the SELECTED receiver's scope streams over LAN, so the
+        live waterfall belongs to whichever pan is the selected/TX receiver;
+        the other pan's waterfall is idle until you swap select/TX to it
+        (routing handled in the stream loop, Stage B)."""
         a = self.adapter
         if not hasattr(a, "sub_active"):
             return
@@ -1262,10 +1265,17 @@ class Radio:
         sub = self.slices.get(self.SUB_SLICE)
 
         if not sub_on:
-            if sub is not None:                            # dualwatch off -> retire slice 1
+            if sub is not None:                            # SUB off -> retire slice 1 + its pan
+                spid = sub.get("pan")
                 self.slices.pop(self.SUB_SLICE, None)
                 self.status(self.conn, f"slice {self.SUB_SLICE} in_use=0")
-                log("[dual] SUB receiver off -> removed slice 1")
+                if spid is not None and spid != self._primary_pan():
+                    swid = self.pans.get(spid, {}).get("wf_id")
+                    self.pans.pop(spid, None)              # stop streaming the SUB pan
+                    self.status(self.conn, f"display pan 0x{spid:08X} removed")
+                    if swid is not None:
+                        self.status(self.conn, f"display waterfall 0x{swid:08X} removed")
+                log("[dual] SUB receiver off -> removed slice 1 + its pan")
             return
 
         f = a.sub_freq_hz()
@@ -1274,20 +1284,25 @@ class Radio:
         fmhz = f / 1e6
         m = a.sub_mode()
         mode = m if m in ("LSB", "USB", "AM", "CW", "FM", "RTTY", "DV") else "FM"
-        pid = None
-        prim = self.slices.get(self.active_slice)          # SUB shares the primary's pan
-        if prim:
-            pid = prim.get("pan")
-        pid = pid or self._primary_pan()
 
-        if sub is None:                                    # dualwatch on -> create slice 1
+        if sub is None:                                    # SUB on -> create its own pan + slice 1
+            spid = self._new_pan()                         # SUB gets a SECOND, stacked panadapter
+            self.pans[spid]["center"] = fmhz               # framed on the SUB band
+            self.pans[spid]["slice"] = self.SUB_SLICE
             self.slices[self.SUB_SLICE] = {"freq": fmhz, "mode": mode,
-                                           "active": False, "pan": pid, "sub": True}
+                                           "active": False, "pan": spid, "sub": True}
+            self.emit_pan_status(self.conn, spid)          # AE stacks a 2nd panadapter (client_handle claim)
             self.emit_slice_status(self.conn, self.SUB_SLICE)
-            log(f"[dual] SUB receiver on -> slice 1 @ {fmhz:.5f} {mode} on pan 0x{pid:08X}")
-        elif abs(sub["freq"] - fmhz) > 5e-6 or sub["mode"] != mode or sub.get("pan") != pid:
-            sub["freq"], sub["mode"], sub["pan"] = fmhz, mode, pid   # follow the rig
-            self.emit_slice_status(self.conn, self.SUB_SLICE)
+            log(f"[dual] SUB on -> slice 1 @ {fmhz:.5f} {mode} on NEW pan 0x{spid:08X}")
+        else:
+            spid = sub.get("pan")
+            moved = abs(sub["freq"] - fmhz) > 5e-6 or sub["mode"] != mode
+            if moved:
+                sub["freq"], sub["mode"] = fmhz, mode      # follow the rig
+                if spid in self.pans:
+                    self.pans[spid]["center"] = fmhz       # keep the SUB pan framed on its band
+                    self.emit_pan_status(self.conn, spid)
+                self.emit_slice_status(self.conn, self.SUB_SLICE)
 
     def emit_radio_status(self, conn):
         # Capability advert. AE computes MaxSlices/SlicesRemaining from the radio status;
@@ -1613,11 +1628,25 @@ class Radio:
                     except Exception: m = None
                 self.last_vfo_dbm = m.s_meter_dbm if m is not None \
                     else levels[ctx.center]                         # active slice (pan centre) -> rack strip
+                # Which pan owns the live scope? The 9700 streams ONLY the
+                # selected/TX receiver's scope, so only that pan gets the real
+                # pixels; a SUB pan (non-selected receiver) shows a floor until
+                # you swap select/TX to it. The primary pan (slice 0's) is the
+                # selected receiver's; a pan flagged as the SUB slice's is not.
+                sub_pid = None
+                subsl = self.slices.get(self.SUB_SLICE)
+                if subsl is not None:
+                    sub_pid = subsl.get("pan")
+                floor_pix = [self.dbm_to_pixel(self.min_dbm)] * len(pixels)
+                floor_int = [self.dbm_to_wf_raw(self.min_dbm)] * len(intens)
                 try:
                     for pid, pan in list(self.pans.items()):        # AE stacks one panadapter per receiver
                         low_hz = (self._pan_center(pid) - self.span_mhz / 2) * 1e6
-                        s.sendto(fft_packet(pid, fseq & 0xF, pixels, fi), dest); fseq += 1
-                        s.sendto(wf_packet(pan["wf_id"], wseq & 0xF, intens, low_hz, binbw_hz, tc, auto_black=wf_ab), dest); wseq += 1
+                        live = (pid != sub_pid)                     # non-SUB pan = the selected rx = live
+                        px = pixels if live else floor_pix
+                        it = intens if live else floor_int
+                        s.sendto(fft_packet(pid, fseq & 0xF, px, fi), dest); fseq += 1
+                        s.sendto(wf_packet(pan["wf_id"], wseq & 0xF, it, low_hz, binbw_hz, tc, auto_black=wf_ab), dest); wseq += 1
                     for g in list(self.slices):                     # per-slice S-meter (level at slice = pan centre)
                         s.sendto(meter_packet(self.meter_sid, mseq & 0xF, SLICE_METER_BASE + g, levels[ctx.center]), dest); mseq += 1
                 except OSError as e:
@@ -1666,6 +1695,23 @@ class Radio:
                     self._sync_sub_slice()
                 except Exception:
                     pass   # SUB-slice sync must never kill the stream thread
+
+                # Deaf-session recovery: if the adapter's watchdog flagged a
+                # wedged CI-V session, reconnect it on a BACKGROUND thread
+                # (reconnect() sleeps through the radio's stale window, so it
+                # must not block the stream loop). One reconnect at a time.
+                try:
+                    if (hasattr(self.adapter, "needs_reconnect")
+                            and self.adapter.needs_reconnect()
+                            and not getattr(self, "_reconnecting", False)):
+                        self._reconnecting = True
+                        def _do_reconnect():
+                            try: self.adapter.reconnect()
+                            finally: self._reconnecting = False
+                        threading.Thread(target=_do_reconnect, daemon=True).start()
+                        log("[civ] deaf session -> reconnect thread started")
+                except Exception:
+                    pass
 
             # TX meters every frame: real power/SWR while keyed, ~0 W / 1.0 SWR when not,
             # so AE's meter decays back to zero on de-key. CW/CWX key power per element.
