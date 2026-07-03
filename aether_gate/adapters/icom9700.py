@@ -518,13 +518,17 @@ class Icom9700Adapter(RadioAdapter):
             self._diag_t, self._diag_n = now, civ.frames
 
         sel_dbm = self._smeter_dbm(civ.smeter_raw) if civ else None
-        sub_on = self.sub_active()
+        # NB these are the two VFOs (A/B) of the SELECTED receiver — NOT the two
+        # RECEIVERS. 25 00 = active VFO, 25 01 = the other VFO of the same rx.
+        # The 2nd RECEIVER (RX2) is only reachable via a 07 B0 main/sub swap
+        # (proven ic9700_findrx2); it does NOT appear in 25 00/25 01. (Earlier
+        # this was mislabelled MAIN/SUB — corrected 2026-07-02.)
         vfos = []
         if civ:
-            vfos.append({"name": "MAIN/SEL", "freq_hz": civ.freq_hz,
+            vfos.append({"name": "sel rx · VFO A", "freq_hz": civ.freq_hz,
                          "mode": civ.mode, "selected": True})
-            if sub_on:
-                vfos.append({"name": "SUB", "freq_hz": civ.other_freq_hz,
+            if civ.other_freq_hz:
+                vfos.append({"name": "sel rx · VFO B", "freq_hz": civ.other_freq_hz,
                              "mode": civ.other_mode, "selected": False})
         return {
             "radio": "IC-9700",
