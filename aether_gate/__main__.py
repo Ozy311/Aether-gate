@@ -43,6 +43,17 @@ def build_adapter(name, args):
                    local_ip=args.radio_local_ip, radio_port=args.radio_port,
                    civ_addr=int(str(args.civ_addr), 16), model=model,
                    serial=serial, station=station)
+    if name == "kenwood":
+        serial = args.serial if args.serial != "GATE0001" else "GATEKENW"
+        station = args.station if args.station != "aether-gate 1" else "aether-gate kenwood"
+        return cls(model=args.kw_model,
+                   rigctld_host=args.rigctld_host, rigctld_port=args.rigctld_port,
+                   hamlib_model=args.hamlib_model,
+                   soapy_driver=args.soapy_driver, soapy_args=args.soapy_args,
+                   samp_rate=args.samp_rate, gain_db=args.gain,
+                   direct_samp=args.direct_samp, agc=args.agc,
+                   advertise=(args.model if args.model != "FLEX-6600" else None),
+                   serial=serial, station=station)
     return cls()
 
 
@@ -77,6 +88,11 @@ def main(argv=None):
     ap.add_argument("--radio-port", type=int, default=50001, help="icom9700 adapter: control port (default 50001)")
     ap.add_argument("--radio-local-ip", default=None, help="icom9700 adapter: local IP that reaches the radio (default: autodetect; set when the radio LAN differs from --ip, e.g. gate advertised on Tailscale but radio on the LAN)")
     ap.add_argument("--civ-addr", default="A2", help="icom9700 adapter: radio CI-V address hex (default A2)")
+    # kenwood adapter options (hamlib control + IF-tap SDR spectrum; reuses --soapy-*/--gain/--samp-rate)
+    ap.add_argument("--kw-model", default="TS-2000", help="kenwood adapter: Kenwood model (TS-2000/TS-590SG/TS-890S)")
+    ap.add_argument("--rigctld-host", default="127.0.0.1", help="kenwood adapter: rigctld daemon host")
+    ap.add_argument("--rigctld-port", type=int, default=4532, help="kenwood adapter: rigctld TCP port (default 4532)")
+    ap.add_argument("--hamlib-model", type=int, default=None, help="kenwood adapter: override the rigctld model id (rigctl -l)")
     ap.add_argument("--serial", default="GATE0001", help="advertised Flex serial (unique per gate; avoids AE chooser collisions)")
     ap.add_argument("--station", default="aether-gate 1", help="station name AE displays (number per dongle: 'aether-gate 1', 'aether-gate 2', ...)")
     args = ap.parse_args(argv)
