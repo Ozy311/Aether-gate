@@ -102,7 +102,23 @@ class KenwoodAdapter(RadioAdapter):
         print(f"[kenwood] spawning rigctld: {' '.join(cmd)}", flush=True)
         self._rigctld_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                                stderr=subprocess.STDOUT)
-        time.sleep(1.5)   # let it bind + open the serial port
+        # wait until rigctld is actually accepting connections (it can take a
+        # couple of seconds to open the serial port + bind on a Pi) — poll up to 8s.
+        import socket as _sock
+        end = time.monotonic() + 8.0
+        while time.monotonic() < end:
+            time.sleep(0.4)
+            if self._rigctld_proc.poll() is not None:
+                raise RuntimeError(f"rigctld exited immediately (rc={self._rigctld_proc.returncode}) "
+                                   f"— check serial port {self._serial_port} / model {self._hamlib_model}")
+            try:
+                s = _sock.create_connection(("127.0.0.1", self._ctl.port), 0.5)
+                s.close()
+                print("[kenwood] rigctld ready", flush=True)
+                return
+            except OSError:
+                continue
+        print("[kenwood] WARNING: rigctld not accepting connections after 8s", flush=True)
 
     # --- lifecycle -------------------------------------------------------
     def open(self):
