@@ -78,14 +78,15 @@ class KenwoodAdapter(RadioAdapter):
                                         min_span_hz=48_000.0, max_span_hz=samp_rate,
                                         bands=bands)
 
-        # rig state (from hamlib), refreshed by a gentle background poll
+        # rig state (from hamlib), refreshed by the single worker thread
         self._freq_hz = None
         self._mode = None
         self._smeter_db = None
-        self._poll_t = 0.0
+        self._set_freq_target = None    # AE-requested freq (worker applies, coalesced)
+        self._set_mode_target = None    # AE-requested mode
+        self._ae_drive_t = 0.0          # when AE last drove a set (suppresses dial-read echo)
         self._poll_run = False
         self._poll_thread = None
-        self._steer_lock = threading.Lock()
 
     # --- rigctld auto-spawn ---------------------------------------------
     def _spawn_rigctld(self):
@@ -159,29 +160,56 @@ class KenwoodAdapter(RadioAdapter):
                 try: self._rigctld_proc.kill()
                 except Exception: pass
 
-    # --- CAT-steer: keep the dongle following the rig's dial -------------
+    # --- the SINGLE hamlib worker: ONLY this thread touches rigctld -------
+    # 4800-baud serial can't take contention: the old design had the poll
+    # thread AND the control-thread setters both hitting rigctld, corrupting
+    # request/reply and dropping the link on rapid AE tunes (the "crash +
+    # recover to 14.100" symptom). Now ALL rigctld I/O is serialised through
+    # this one loop: it services a pending AE freq/mode SET first (coalesced —
+    # only the latest target), else does one READ per tick to follow the dial.
     def _poll_loop(self):
-        # ~3 Hz: read the rig's freq/mode/S-meter and steer the dongle to follow.
-        # Gentle by design (IC-9700 lesson: don't flood CAT).
+        read_i = 0
         while self._poll_run:
-            time.sleep(0.35)
+            time.sleep(0.20)
             try:
-                f = self._ctl.get_freq_hz()
-                if f and f != self._freq_hz:
-                    self._freq_hz = f
-                    # move the DEMOD target to the rig's freq; SoapyAdapter only
-                    # physically retunes the dongle when the slice nears the
-                    # window edge, so small dial moves stay in-window (cheap).
-                    self._sdr.set_slice(float(f))
-                m = self._ctl.get_mode()
-                if m and m != self._mode:
-                    self._mode = m
-                    self._sdr.set_mode(m)
-                s = self._ctl.get_smeter_db()
-                if s is not None:
-                    self._smeter_db = s
+                # 1. AE asked to SET freq? (coalesced: only the latest wins)
+                tgt = self._set_freq_target
+                if tgt is not None:
+                    self._set_freq_target = None
+                    if self._ctl.set_freq_hz(tgt):
+                        self._freq_hz = tgt
+                        self._sdr.set_slice(float(tgt))
+                    self._ae_drive_t = time.monotonic()   # suppress dial-read echo briefly
+                    continue
+                # 2. AE asked to SET mode?
+                mtgt = self._set_mode_target
+                if mtgt is not None:
+                    self._set_mode_target = None
+                    if self._ctl.set_mode(mtgt):
+                        self._mode = mtgt
+                        self._sdr.set_mode(mtgt)
+                    continue
+                # 3. otherwise READ the rig to follow the dial. Round-robin so
+                #    each read is one cheap serial transaction. Hold freq-read
+                #    off for 1.5s after an AE set so we don't fight the user.
+                read_i += 1
+                if read_i % 3 == 0:
+                    if time.monotonic() - getattr(self, "_ae_drive_t", 0) > 1.5:
+                        f = self._ctl.get_freq_hz()
+                        if f and abs((self._freq_hz or 0) - f) > 1:
+                            self._freq_hz = f
+                            self._sdr.set_slice(float(f))
+                elif read_i % 3 == 1:
+                    m = self._ctl.get_mode()
+                    if m and m != self._mode:
+                        self._mode = m
+                        self._sdr.set_mode(m)
+                else:
+                    s = self._ctl.get_smeter_db()
+                    if s is not None:
+                        self._smeter_db = s
             except Exception:
-                pass   # a CAT hiccup must not kill the steer loop
+                pass   # a CAT hiccup must not kill the worker
 
     # --- spectrum (delegated to the dongle) -----------------------------
     def get_iq(self, n, center_hz, span_hz):
@@ -190,32 +218,20 @@ class KenwoodAdapter(RadioAdapter):
     def get_audio(self, *a, **k):
         return self._sdr.get_audio(*a, **k) if hasattr(self._sdr, "get_audio") else None
 
-    # --- control (AE -> rig, via hamlib) --------------------------------
+    # --- control (AE -> rig): POST a target; the worker does the hamlib I/O.
+    # Non-blocking + coalescing — rapid AE tunes just overwrite the target, so
+    # the serial link never backs up (fixes the crash-on-rapid-tune).
     def retune(self, center_hz):
-        # AE moved the pan/slice -> tell the RIG (hamlib) AND steer the dongle.
-        try:
-            self._ctl.set_freq_hz(int(center_hz))
-        except Exception:
-            pass
-        self._freq_hz = int(center_hz)
-        self._sdr.retune(center_hz)
+        self._set_freq_target = int(center_hz)
+        self._sdr.retune(center_hz)          # dongle centre is cheap + local, do it now
 
     def set_slice(self, slice_hz):
-        # AE tuned within the pan -> move the rig's dial + the demod target.
-        try:
-            self._ctl.set_freq_hz(int(slice_hz))
-        except Exception:
-            pass
-        self._freq_hz = int(slice_hz)
-        self._sdr.set_slice(slice_hz)
+        self._set_freq_target = int(slice_hz)
+        self._sdr.set_slice(slice_hz)        # local demod target, immediate
 
     def set_mode(self, mode):
-        try:
-            self._ctl.set_mode(mode)
-        except Exception:
-            pass
-        self._mode = mode
-        self._sdr.set_mode(mode)
+        self._set_mode_target = mode
+        self._sdr.set_mode(mode)             # local, immediate
 
     def set_span(self, span_hz):
         # dongle span is fixed by sample rate; nothing to push to the rig.
@@ -233,6 +249,14 @@ class KenwoodAdapter(RadioAdapter):
 
     def radio_mode(self):
         return self._mode
+
+    def receivers(self):
+        """Single receiver -> one VFO. The engine's radio->AE sync
+        (_sync_receivers) drives slice 0 from this list, so the rig's dial
+        (read by the worker) reaches AE. One entry = one slice, no SUB."""
+        if not self._freq_hz:
+            return []
+        return [{"freq_hz": self._freq_hz, "mode": self._mode}]
 
     def read_meters(self):
         # hamlib S-meter is dB relative to S9 (S9 = -73 dBm on HF).
