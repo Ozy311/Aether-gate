@@ -200,10 +200,11 @@ class KenwoodAdapter(RadioAdapter):
                             self._freq_hz = f
                             self._sdr.set_slice(float(f))
                 elif read_i % 3 == 1:
-                    m = self._ctl.get_mode()
-                    if m and m != self._mode:
-                        self._mode = m
-                        self._sdr.set_mode(m)
+                    if time.monotonic() - getattr(self, "_ae_drive_t", 0) > 1.5:
+                        m = self._ctl.get_mode()
+                        if m and m != self._mode:
+                            self._mode = m
+                            self._sdr.set_mode(m)
                 else:
                     s = self._ctl.get_smeter_db()
                     if s is not None:
@@ -231,6 +232,9 @@ class KenwoodAdapter(RadioAdapter):
 
     def set_mode(self, mode):
         self._set_mode_target = mode
+        self._mode = mode                    # optimistic: reflect intent NOW so the
+                                             # radio->AE sync doesn't read stale + fight it
+        self._ae_drive_t = time.monotonic()  # also guard the freq/mode read loop briefly
         self._sdr.set_mode(mode)             # local, immediate
 
     def set_span(self, span_hz):
