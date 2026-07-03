@@ -11,10 +11,13 @@ and Start/Stop that spawns `python -m aether_gate ...` (reusing all the CLI).
 import http.server
 import json
 import os
+import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
+import time
 
 from .adapters import available
 from .adapters.icom import radios as icom_radios
@@ -135,6 +138,109 @@ def _status():
         return {"running": running, "pid": (_proc.pid if running else None), "argv": _last_argv}
 
 
+# --- "Known info" health checks ------------------------------------------
+def _classify_ip(ip):
+    try:
+        b = [int(x) for x in ip.split(".")]
+    except Exception:
+        return "warn", "unrecognised address"
+    if ip.startswith("127."):
+        return "bad", "loopback - AE on other machines can't reach the gate here"
+    if b[0] == 100 and 64 <= b[1] <= 127:
+        return "warn", "CGNAT/Tailscale range - set --ip to a real LAN address so AE can reach it"
+    if ip.startswith("10.") or ip.startswith("192.168.") or (b[0] == 172 and 16 <= b[1] <= 31):
+        return "ok", "private LAN address"
+    return "warn", "not a private LAN address - check AE can reach it"
+
+
+def _probe_icom(ip, port=50001, timeout=1.2):
+    """Unicast RS-BA1 are-you-there; True if the radio answers I-am-here."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("", 0)); lp = s.getsockname()[1]
+        o = _local_ip().split(".")
+        my_id = (int(o[2]) << 24) | (int(o[3]) << 16) | (lp & 0xFFFF)
+        s.sendto(struct.pack("<IHHII", 0x10, 0x03, 0, my_id, 0), (ip, int(port)))
+        s.settimeout(timeout)
+        d = s.recvfrom(64)[0]; s.close()
+        return len(d) >= 6 and struct.unpack("<H", d[4:6])[0] == 0x04
+    except Exception:
+        return False
+
+
+def _list_serial_ports():
+    ports = []
+    try:
+        if os.name == "nt":
+            import winreg
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DEVICEMAP\SERIALCOMM")
+            i = 0
+            while True:
+                try:
+                    ports.append(winreg.EnumValue(k, i)[1]); i += 1
+                except OSError:
+                    break
+        else:
+            import glob
+            ports = sorted(glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"))
+    except Exception:
+        pass
+    return ports
+
+
+def _known_checks():
+    out = []
+    def add(group, label, value, status, detail=""):
+        out.append({"group": group, "label": label, "value": value, "status": status, "detail": detail})
+
+    ip = _local_ip(); st, det = _classify_ip(ip)
+    add("Gate host", "Advertise IP", ip, st, det)
+
+    try:
+        import numpy; add("Dependencies", "numpy", numpy.__version__, "ok")
+    except Exception:
+        add("Dependencies", "numpy", "MISSING", "bad", "required for the core FFT")
+    try:
+        import SoapySDR
+        add("Dependencies", "SoapySDR", "installed", "ok")
+        try:
+            devs = SoapySDR.Device.enumerate()
+            add("SDR devices", "dongles", f"{len(devs)} found",
+                "ok" if devs else "warn",
+                ", ".join(str(d.get("driver", "?")) for d in devs) if devs
+                else "none plugged in - needed for dongle / Kenwood-Yaesu IF-tap spectrum")
+        except Exception as e:
+            add("SDR devices", "dongles", "enumerate failed", "warn", str(e)[:80])
+    except Exception:
+        add("Dependencies", "SoapySDR", "not installed", "warn",
+            "needed for SDR dongles + Kenwood/Yaesu IF-tap spectrum")
+    has_rig = bool(shutil.which("rigctld"))
+    add("Dependencies", "hamlib (rigctld)", "found" if has_rig else "not found",
+        "ok" if has_rig else "warn", "" if has_rig else "needed for Kenwood/Yaesu CAT control")
+
+    sp = _list_serial_ports()
+    add("Serial ports", "detected", ", ".join(sp) if sp else "none",
+        "ok" if sp else "info", "" if sp else "no COM/ttyUSB ports (needed for CAT rigs)")
+
+    for name, cfg in _load_profiles().get("profiles", {}).items():
+        ad = cfg.get("adapter")
+        if ad == "icom9700" and cfg.get("radio_ip"):
+            ok = _probe_icom(cfg["radio_ip"], cfg.get("radio_port", 50001))
+            add("Radios (saved profiles)", name, cfg["radio_ip"], "ok" if ok else "bad",
+                "responds on Icom LAN :50001" if ok
+                else "no reply - powered on? Network function enabled? correct IP?")
+        elif ad == "kenwood" and cfg.get("rig_serial_port"):
+            port = cfg["rig_serial_port"]
+            present = port in sp or os.path.exists(port)
+            add("Radios (saved profiles)", name, port, "ok" if present else "bad",
+                "serial port present" if present else "serial port not found - plugged in?")
+
+    stt = _status()
+    add("Gate", "process", f"running (pid {stt['pid']})" if stt["running"] else "stopped",
+        "ok" if stt["running"] else "info")
+    return out
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -160,6 +266,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(200, _load_profiles())
         elif p.startswith("/api/status"):
             self._json(200, _status())
+        elif p.startswith("/api/known"):
+            self._json(200, _known_checks())
+        elif p.startswith("/known"):
+            self._send(200, KNOWN_PAGE, "text/html; charset=utf-8")
         else:
             self._json(404, {})
 
@@ -223,7 +333,7 @@ PAGE = r"""<!DOCTYPE html><html><head><meta charset=utf-8>
  .adv summary{color:#58a6ff;cursor:pointer;margin-top:8px;font-size:13px}
  a{color:#58a6ff}
 </style></head><body>
-<h1>Aether-gate</h1><div class=sub>Radio setup &amp; launcher &mdash; present any radio to AetherSDR as a Flex</div>
+<h1>Aether-gate</h1><div class=sub>Radio setup &amp; launcher &mdash; present any radio to AetherSDR as a Flex &middot; <a href="/known" target=_blank>Known info / status &#8599;</a></div>
 
 <div class=hintbox id=hint>
  <b>Getting started:</b>
@@ -434,6 +544,48 @@ async function poll(){const s=await (await fetch('/api/status')).json();
  const cp=document.getElementById('ctl_port').value||'8731';
  document.getElementById('panellink').href='http://'+location.hostname+':'+cp+'/';}
 init();
+</script></body></html>"""
+
+
+KNOWN_PAGE = r"""<!DOCTYPE html><html><head><meta charset=utf-8>
+<title>Aether-gate - known info</title><meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+ body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;max-width:660px;margin:0 auto;padding:20px}
+ h1{color:#58a6ff;margin:0 0 2px} .sub{color:#8b949e;margin:0 0 14px;font-size:13px}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px;margin:12px 0}
+ .gh{color:#58a6ff;font-weight:600;font-size:13px;margin-bottom:6px}
+ .row{padding:5px 0;border-top:1px solid #21262d;display:flex;align-items:center;flex-wrap:wrap}
+ .row:first-of-type{border-top:none}
+ .dot{width:11px;height:11px;border-radius:50%;display:inline-block;margin-right:9px;flex:0 0 auto}
+ .lbl{flex:0 0 46%;font-size:14px} .val{color:#adbac7;font-size:14px}
+ .det{flex-basis:100%;color:#6e7681;font-size:12px;margin:2px 0 0 20px}
+ a{color:#58a6ff}
+</style></head><body>
+<h1>Aether-gate &mdash; known info</h1>
+<div class=sub>Turn it on and check: <b style=color:#3fb950>green</b> = good &middot;
+ <b style=color:#d29922>amber</b> = check &middot; <b style=color:#da3633>red</b> = problem &middot;
+ <b style=color:#6e7681>grey</b> = info. Auto-refreshes every 3 s.</div>
+<div id=out>checking&hellip;</div>
+<div style=margin-top:14px><a href="/">&larr; back to setup</a></div>
+<script>
+const COL={ok:'#3fb950',warn:'#d29922',bad:'#da3633',info:'#6e7681'};
+function esc(s){return String(s).replace(/</g,'&lt;');}
+async function poll(){
+ let rows; try{ rows=await (await fetch('/api/known')).json(); }catch(e){ return; }
+ const groups={}; rows.forEach(r=>{(groups[r.group]=groups[r.group]||[]).push(r);});
+ let h='';
+ for(const g in groups){
+  h+='<div class=card><div class=gh>'+esc(g)+'</div>';
+  groups[g].forEach(r=>{
+   h+='<div class=row><span class=dot style="background:'+(COL[r.status]||'#6e7681')+'"></span>'
+     +'<span class=lbl>'+esc(r.label)+'</span><span class=val>'+esc(r.value)+'</span>'
+     +(r.detail?'<div class=det>'+esc(r.detail)+'</div>':'')+'</div>';
+  });
+  h+='</div>';
+ }
+ document.getElementById('out').innerHTML=h||'<div class=card>no checks</div>';
+}
+poll(); setInterval(poll,3000);
 </script></body></html>"""
 
 
