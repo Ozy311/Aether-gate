@@ -54,6 +54,14 @@ REGISTRY = {
         spectrum="soapy-iftap", hf_dongle_needed=True, verified=False,
         notes="HF/6m/2m/70cm multibander. hamlib -m 2014. No CAT scope -> IF-tap dongle. VERIFY."),
 
+    "TS-450S": KenwoodRadio(
+        model="TS-450S", hamlib_model=2003, advertise="FLEX-6600",
+        # HF-only (160-10m incl WARC); no 60m, no 6m. Built-in CAT (no IF-10 board needed).
+        bands=[b for b in _HF if b.name != "60m"],
+        spectrum="soapy-iftap", hf_dongle_needed=True, verified=False,
+        notes="HF-only 160-10m. Built-in CAT via rear serial (no IF-10 board). hamlib -m 2003 "
+              "(confirmed vs 4.6.2 on Pi5). Old rig: typ 4800 baud; picky about cable. No CAT scope."),
+
     "TS-590SG": KenwoodRadio(
         model="TS-590SG", hamlib_model=2037, advertise="FLEX-6600",
         bands=_HF + _6M, spectrum="soapy-iftap", hf_dongle_needed=True, verified=False,
