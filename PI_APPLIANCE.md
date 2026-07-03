@@ -1,0 +1,128 @@
+# Aether-gate — Raspberry Pi appliance
+
+Turn a Raspberry Pi into a flash-and-go Aether-gate box: power it on, browse to
+**`http://aethergate.local:8730`**, pick your radio, hit **Start**, and it
+appears in AetherSDR. This is the recommended way to run the gate unattended.
+
+See also: [`deploy/install-pi.sh`](deploy/install-pi.sh) (the installer),
+[`deploy/systemd/README.md`](deploy/systemd/README.md) (running a radio as a
+service), [`ONBOARDING.md`](ONBOARDING.md) (the day-one design).
+
+---
+
+## Which Pi?
+
+| | Works? | Notes |
+|---|---|---|
+| **Pi 5** | ✅ best | Proven appliance. Best USB power/bandwidth (drove the V4 dongle + an FTDI CAT cable together, no brownout). |
+| **Pi 4** (2GB+) | ✅ fine | Runs the gate comfortably. Source build is a bit slower (~15–20 min vs ~10–15). USB power is more marginal — use a **powered hub** if a dongle misbehaves. |
+| **Pi 3 / Zero 2** | ⚠️ maybe | Not tested. Icom-LAN-only (`--no-sdr`) would likely be OK; the source build will be slow. |
+
+**The one thing that matters more than the model: the OS.** Flash **current
+64-bit Raspberry Pi OS (Debian 13 / trixie, Python 3.13)** — the exact stack the
+installer is pinned against. An older release (Bookworm/Bullseye) shifts apt
+names and Python paths; the installer detects this and warns, but flashing
+current Pi OS is the smooth path. **Always 64-bit** (aarch64) — a 32-bit OS
+fights the source builds.
+
+---
+
+## Install
+
+On a fresh Pi OS Lite (SSH enabled, on your LAN):
+
+```sh
+git clone https://github.com/nigelfenton/Aether-gate.git
+cd Aether-gate
+sudo ./deploy/install-pi.sh              # full appliance (with the SDR spectrum stack)
+```
+
+Variants:
+
+```sh
+sudo ./deploy/install-pi.sh --no-sdr     # IC-9700 / Icom-LAN only (numpy) — fast, no long build
+./deploy/install-pi.sh --check           # report what's present/missing; changes nothing
+sudo ./deploy/install-pi.sh --dry-run    # print every step; changes nothing
+```
+
+The installer is **idempotent** — safe to re-run (it skips builds already done).
+
+### What it installs
+
+- **apt:** `python3-numpy`, `libhamlib-utils` (rigctld), `avahi-daemon`, build tools.
+- **Source-built into `/usr/local`** (only with the SDR stack — the default):
+  - **rtl-sdr-blog fork** — the V4 dongle + HF direct-sampling. *The apt
+    `librtlsdr` (2.0.2) does not drive the RTL-SDR V4 well — that's why we build
+    the fork.*
+  - **SoapySDR** core + its Python 3 bindings.
+  - **SoapyRTLSDR** module.
+  - The exact upstream commits are **pinned** in `install-pi.sh` (the versions
+    proven on the Pi5), so a rebuild is reproducible.
+- The `aether_gate` package copied to `~/gate`.
+- **systemd `aether-gate-setup.service`** — boots straight to the Setup UI on `:8730`.
+
+### The dependency split (why `--no-sdr` exists)
+
+| Radio path | Needs |
+|---|---|
+| **IC-9700 / Icom LAN** | **numpy only** — no native libs. The easy path. |
+| Kenwood / Yaesu (CAT) | hamlib (apt) + the SoapySDR stack (IF-tap spectrum) |
+| RTL / Airspy / SDRplay dongle | the SoapySDR stack |
+
+If you only run an Icom-LAN rig, `--no-sdr` skips the ~15-minute source build
+entirely.
+
+---
+
+## First boot
+
+1. Power on. Give it a minute (first boot + any build finishing if you just installed).
+2. Browse **`http://aethergate.local:8730`** (or `http://<pi-ip>:8730`).
+3. Pick your radio family, fill the connection fields, **Start**.
+4. Save it as a **profile** and tick **"connect on launch"** so it comes up on its own next boot.
+
+## Always-on radio (recommended for a dedicated box)
+
+The Setup UI starts the gate as a *child* — fine for interactive use, but a
+crashed launcher can't shut the gate down cleanly (for an IC-9700 that can leave
+a phantom session). For an unattended box, run the radio as its **own systemd
+service** so `systemctl stop` shuts it down gracefully:
+
+```sh
+sudo cp ~/gate/deploy/systemd/aether-gate-9700.service /etc/systemd/system/
+sudoedit /etc/systemd/system/aether-gate-9700.service   # set radio IP, --pass, --ip, --ae
+sudo systemctl enable --now aether-gate-9700
+journalctl -u aether-gate-9700 -f
+```
+
+See [`deploy/systemd/README.md`](deploy/systemd/README.md) for why-a-service and
+the graceful-stop verification.
+
+---
+
+## Capturing an image (once installed & configured)
+
+After the appliance works the way you want:
+
+1. Optionally clear machine-specific state (SSH host keys, logs, saved Wi-Fi) for
+   a clean template.
+2. Shut down, pull the SD card, and image it (`dd`, or Raspberry Pi Imager's
+   "read" / a tool like `pishrink` to shrink the image before sharing).
+3. That image is now flash-and-go for the next Pi.
+
+> ⚠️ **GPL note:** handing that image (a built binary distribution) to *anyone*
+> triggers the GPL-3.0 obligation to offer the complete corresponding source —
+> which is fine, it's all in this repo. Just ship it *with* the repo URL / a copy
+> of the source. (Same rule as showing anyone a running build.)
+
+---
+
+## Status / what's proven
+
+- ✅ Installer written, **pinned** to the Pi5's exact working versions.
+- ✅ `--check` and `--dry-run` validated on the Pi5 (all probes green; dry-run
+  walks every step).
+- ⚠️ **Not yet run end-to-end on a genuinely fresh flash** — the Pi5 already has
+  the SDR stack, so the installer's source-build path skips there (as designed
+  and idempotent). The true flash-and-go test is a clean Pi OS Lite install;
+  that's the next milestone once a spare Pi/SD card is on hand.

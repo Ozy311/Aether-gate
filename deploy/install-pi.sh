@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+#
+# Aether-gate — Raspberry Pi appliance installer.
+# Copyright (C) 2026 Nigel Fenton (G0JKN). GPL-3.0-or-later.
+#
+# Turns a fresh 64-bit Raspberry Pi OS (Debian 13 / trixie, Python 3.13) into an
+# Aether-gate appliance: browse http://aethergate.local:8730 -> pick a radio ->
+# Start. Idempotent — safe to re-run.
+#
+# WHAT IT INSTALLS
+#   * apt: numpy, hamlib (rigctld), avahi, build tools           [always]
+#   * source-built into /usr/local (the SDR spectrum path):      [--with-sdr, default ON]
+#       - rtl-sdr-blog fork  (V4 dongle + HF direct-sampling; the apt librtlsdr
+#         2.0.2 does NOT drive the RTL-SDR V4 well — hence the fork)
+#       - SoapySDR core      (+ python3 bindings)
+#       - SoapyRTLSDR module
+#     Icom-LAN rigs (IC-9700) need ONLY numpy — skip the SDR stack with --no-sdr
+#     for a fast LAN-only install.
+#   * the aether_gate package copied to /home/pi/gate
+#   * systemd: aether-gate-setup.service (boot -> Setup UI on :8730)
+#
+# USAGE
+#   sudo ./install-pi.sh                 # full appliance (with SDR stack)
+#   sudo ./install-pi.sh --no-sdr        # Icom-LAN only (numpy) — fast
+#   ./install-pi.sh --check              # report what's present/missing; no changes
+#   sudo ./install-pi.sh --dry-run       # print every step; make NO changes
+#
+# The pinned commits below are the exact versions proven on the Pi5 appliance
+# (2026-07-03). Pinning keeps a rebuild reproducible instead of tracking moving
+# upstream HEADs.
+
+set -euo pipefail
+
+# --- pinned upstream versions (proven on the Pi5) ------------------------------
+RTLSDR_REPO="https://github.com/rtlsdrblog/rtl-sdr-blog.git"
+RTLSDR_COMMIT="aed0ea1"                    # "fix declaration warning"
+SOAPY_REPO="https://github.com/pothosware/SoapySDR.git"
+SOAPY_COMMIT="1551ea0"                     # "Fix SWIG parallel Device::make() overloads (#474)"
+SOAPYRTL_REPO="https://github.com/pothosware/SoapyRTLSDR.git"
+SOAPYRTL_COMMIT="b1f568d"                  # "Update Github Action"
+
+GATE_USER="${SUDO_USER:-pi}"
+GATE_HOME="$(getent passwd "$GATE_USER" | cut -d: -f6)"
+GATE_DIR="$GATE_HOME/gate"
+SRC_DIR="$GATE_HOME/gate-build"            # where the SDR sources are cloned/built
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # the checkout this script lives in
+
+WITH_SDR=1
+DRY_RUN=0
+CHECK_ONLY=0
+
+for a in "$@"; do
+  case "$a" in
+    --no-sdr)   WITH_SDR=0 ;;
+    --with-sdr) WITH_SDR=1 ;;
+    --dry-run)  DRY_RUN=1 ;;
+    --check)    CHECK_ONLY=1 ;;
+    -h|--help)  sed -n '2,40p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $a (try --help)"; exit 2 ;;
+  esac
+done
+
+say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf '\033[1;33m[warn] %s\033[0m\n' "$*"; }
+run()  { if [ "$DRY_RUN" = 1 ]; then printf '    [dry-run] %s\n' "$*"; else eval "$@"; fi; }
+
+need_root() {
+  if [ "$CHECK_ONLY" = 0 ] && [ "$DRY_RUN" = 0 ] && [ "$(id -u)" != 0 ]; then
+    echo "This needs root for apt + /usr/local + systemd. Re-run with sudo (or use --check/--dry-run)."
+    exit 1
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# --check : report only, no changes
+# ------------------------------------------------------------------------------
+report() {
+  say "Aether-gate Pi — environment check"
+  . /etc/os-release 2>/dev/null || true
+  info "OS:      ${PRETTY_NAME:-unknown}  ($(uname -m))"
+  info "Model:   $(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo '?')"
+  info "Python:  $(python3 --version 2>&1)"
+  case "${VERSION_CODENAME:-}" in
+    trixie) : ;;
+    bookworm|bullseye) warn "This was proven on trixie (Debian 13 / Py3.13). On ${VERSION_CODENAME} apt names / Python paths may differ — flashing current 64-bit Pi OS is the smooth path." ;;
+    *) warn "Unrecognised OS release — proceed with care." ;;
+  esac
+  [ "$(uname -m)" = "aarch64" ] || warn "Not aarch64 — expected 64-bit Pi OS. A 32-bit OS will fight the source builds."
+
+  chk() { if "$@" >/dev/null 2>&1; then printf '    \033[1;32m[ok]\033[0m   %s\n' "$*"; else printf '    \033[1;31m[--]\033[0m   %s\n' "$*"; fi; }
+  say "Dependencies"
+  chk python3 -c 'import numpy'
+  chk sh -c 'command -v rigctld'
+  chk sh -c 'command -v SoapySDRUtil'
+  chk python3 -c 'import SoapySDR'
+  chk sh -c 'SoapySDRUtil --info 2>/dev/null | grep -q rtlsdr'
+  chk sh -c 'command -v avahi-daemon || test -x /usr/sbin/avahi-daemon'
+  say "Aether-gate"
+  chk test -d "$GATE_DIR/aether_gate"
+  chk systemctl is-enabled aether-gate-setup.service
+  chk python3 -c 'import numpy; import aether_gate' 2>/dev/null || true
+}
+
+if [ "$CHECK_ONLY" = 1 ]; then report; exit 0; fi
+
+need_root
+say "Aether-gate Pi installer  (user=$GATE_USER  gate=$GATE_DIR  with-sdr=$WITH_SDR  dry-run=$DRY_RUN)"
+
+# OS sanity (non-fatal; warn like --check does)
+. /etc/os-release 2>/dev/null || true
+[ "${VERSION_CODENAME:-}" = "trixie" ] || warn "Proven on trixie/Py3.13; you're on '${VERSION_CODENAME:-?}'. If apt/build steps fail, reflash current 64-bit Pi OS."
+[ "$(uname -m)" = "aarch64" ] || warn "Expected aarch64 (64-bit Pi OS)."
+
+# ------------------------------------------------------------------------------
+# 1) apt packages
+# ------------------------------------------------------------------------------
+say "apt: base + build prerequisites"
+APT_PKGS=(python3 python3-numpy python3-dev libhamlib-utils avahi-daemon)
+if [ "$WITH_SDR" = 1 ]; then
+  APT_PKGS+=(build-essential cmake git pkg-config libusb-1.0-0-dev swig)
+fi
+run "apt-get update -y"
+run "apt-get install -y ${APT_PKGS[*]}"
+
+# ------------------------------------------------------------------------------
+# 2) SDR stack (source-built into /usr/local) — the V4/HF spectrum path
+# ------------------------------------------------------------------------------
+# Each build is guarded so a re-run skips work already done. cmake install into
+# /usr/local, then ldconfig so the runtime linker + Soapy find the libs.
+build_cmake() {  # $1=srcdir  $2..=extra cmake args
+  local src="$1"; shift
+  run "mkdir -p '$src/build'"
+  run "cd '$src/build' && cmake -DCMAKE_INSTALL_PREFIX=/usr/local $* .. && make -j\$(nproc) && make install"
+}
+clone_pin() {   # $1=repo $2=commit $3=dest
+  if [ -d "$3/.git" ]; then
+    run "cd '$3' && git fetch --depth 50 origin && git checkout -q '$2'"
+  else
+    run "git clone '$1' '$3' && cd '$3' && git checkout -q '$2'"
+  fi
+}
+
+if [ "$WITH_SDR" = 1 ]; then
+  run "install -d -o '$GATE_USER' -g '$GATE_USER' '$SRC_DIR'"
+
+  if command -v SoapySDRUtil >/dev/null 2>&1 && SoapySDRUtil --info 2>/dev/null | grep -q rtlsdr; then
+    info "SoapySDR + rtlsdr module already present — skipping SDR build (re-run with a wiped $SRC_DIR to force)."
+  else
+    say "SDR build 1/3: rtl-sdr-blog (V4 fork) -> /usr/local"
+    clone_pin "$RTLSDR_REPO" "$RTLSDR_COMMIT" "$SRC_DIR/rtl-sdr-blog"
+    build_cmake "$SRC_DIR/rtl-sdr-blog" "-DINSTALL_UDEV_RULES=ON -DDETACH_KERNEL_DRIVER=OFF"
+
+    say "SDR build 2/3: SoapySDR core (+ python3 bindings) -> /usr/local"
+    clone_pin "$SOAPY_REPO" "$SOAPY_COMMIT" "$SRC_DIR/SoapySDR"
+    build_cmake "$SRC_DIR/SoapySDR" "-DENABLE_PYTHON3=ON"
+
+    say "SDR build 3/3: SoapyRTLSDR module -> /usr/local"
+    clone_pin "$SOAPYRTL_REPO" "$SOAPYRTL_COMMIT" "$SRC_DIR/SoapyRTLSDR"
+    build_cmake "$SRC_DIR/SoapyRTLSDR"
+
+    run "/sbin/ldconfig"
+  fi
+
+  # Blacklist the kernel DVB driver so it doesn't grab the dongle before SoapySDR.
+  # (rtl-sdr-blog's INSTALL_UDEV_RULES lays down the device-perms .rules; this is
+  # the module blacklist half.)
+  say "Blacklist kernel DVB driver (frees the RTL dongle for SoapySDR)"
+  if [ "$DRY_RUN" = 1 ]; then
+    info "[dry-run] write /etc/modprobe.d/blacklist-rtlsdr.conf"
+  else
+    cat > /etc/modprobe.d/blacklist-rtlsdr.conf <<'BL'
+blacklist dvb_usb_rtl28xxu
+blacklist rtl2832
+blacklist rtl2830
+BL
+  fi
+else
+  say "SDR stack SKIPPED (--no-sdr): Icom-LAN rigs need only numpy. Kenwood/Yaesu/dongle spectrum needs SoapySDR — re-run without --no-sdr to add it."
+fi
+
+# ------------------------------------------------------------------------------
+# 3) deploy the aether_gate package
+# ------------------------------------------------------------------------------
+# Copy the package from this checkout to $GATE_DIR (a plain copy — no PYTHONPATH
+# surprises, matches how the Pi5 runs). Excludes dev/junk. If the script is being
+# run FROM $GATE_DIR already, this is a no-op.
+say "Deploy aether_gate -> $GATE_DIR"
+if [ "$REPO_ROOT" != "$GATE_DIR" ]; then
+  run "install -d -o '$GATE_USER' -g '$GATE_USER' '$GATE_DIR'"
+  run "cp -r '$REPO_ROOT/aether_gate' '$GATE_DIR/'"
+  run "cp -r '$REPO_ROOT/deploy' '$GATE_DIR/'"
+  run "chown -R '$GATE_USER':'$GATE_USER' '$GATE_DIR'"
+  # drop __pycache__ so a stale .pyc can't shadow a fresh .py (deploy-race lesson)
+  run "find '$GATE_DIR' -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true"
+else
+  info "running from $GATE_DIR already — skipping copy"
+fi
+
+# ------------------------------------------------------------------------------
+# 4) systemd: Setup UI on boot (:8730) — the first-boot face of the appliance
+# ------------------------------------------------------------------------------
+say "systemd: aether-gate-setup.service (boot -> Setup UI :8730)"
+UNIT_SRC="$GATE_DIR/deploy/systemd/aether-gate-setup.service"
+if [ "$DRY_RUN" = 1 ]; then
+  info "[dry-run] install $UNIT_SRC -> /etc/systemd/system/, enable --now"
+else
+  # the shipped unit assumes User=pi + /home/pi/gate; rewrite for this user/home
+  sed -e "s#User=pi#User=$GATE_USER#" \
+      -e "s#/home/pi/gate#$GATE_DIR#g" \
+      "$UNIT_SRC" > /etc/systemd/system/aether-gate-setup.service
+  systemctl daemon-reload
+  systemctl enable --now aether-gate-setup.service
+fi
+
+# ------------------------------------------------------------------------------
+# done
+# ------------------------------------------------------------------------------
+IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+HOSTN="$(hostname 2>/dev/null).local"
+say "Done."
+cat <<EOF
+    Setup UI:   http://$HOSTN:8730/        (avahi)
+                http://${IP:-<pi-ip>}:8730/
+    Open it, pick a radio, hit Start. Mark a profile "connect on launch" to
+    auto-start next boot.
+
+    For an always-on radio (survives reboots, graceful stop), install a
+    dedicated service instead of relying on the launcher:
+        sudo cp $GATE_DIR/deploy/systemd/aether-gate-9700.service /etc/systemd/system/
+        sudoedit /etc/systemd/system/aether-gate-9700.service   # set radio IP / pass / --ip / --ae
+        sudo systemctl enable --now aether-gate-9700
+    (see $GATE_DIR/deploy/systemd/README.md)
+
+    Verify anytime:  ./install-pi.sh --check
+EOF
