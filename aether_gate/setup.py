@@ -117,6 +117,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with _lock:
                 if _proc is not None and _proc.poll() is None:
                     self._send(409, json.dumps({"ok": False, "error": "already running"})); return
+                # validate required fields so a misconfigured Start returns a clear
+                # message instead of silently spawning a child that dies on argparse.
+                need = {"icom9700": [("radio_ip", "Radio IP"), ("user", "Username"),
+                                     ("password", "Password")]}.get(cfg.get("adapter", "sim"), [])
+                miss = [lbl for k, lbl in need if not str(cfg.get(k, "")).strip()]
+                if miss:
+                    self._send(400, json.dumps({"ok": False, "error": "Fill in: " + ", ".join(miss)})); return
                 argv = _build_argv(cfg)
                 try:
                     _proc = subprocess.Popen(argv)
@@ -269,7 +276,16 @@ init();
 def main(argv=None):
     ip = _local_ip()
     srv = http.server.ThreadingHTTPServer(("0.0.0.0", SETUP_PORT), Handler)
-    print(f"Aether-gate setup UI -> http://{ip}:{SETUP_PORT}/  (and http://127.0.0.1:{SETUP_PORT}/)")
+    url = f"http://127.0.0.1:{SETUP_PORT}/"
+    print(f"Aether-gate setup UI -> http://{ip}:{SETUP_PORT}/  (and {url})")
+    # Best-effort: pop the browser to the setup page once the server is up. Silently
+    # skipped on headless boxes (no browser / no DISPLAY) - the URL is printed above.
+    if "--no-browser" not in (argv or sys.argv[1:]):
+        try:
+            import webbrowser
+            threading.Timer(0.7, lambda: webbrowser.open(url)).start()
+        except Exception:
+            pass
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

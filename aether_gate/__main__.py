@@ -60,6 +60,16 @@ def build_adapter(name, args):
 
 
 def main(argv=None):
+    import sys
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # First-run UX: bare `python -m aether_gate` (or `--setup`) opens the Radio Setup
+    # web UI in the browser (pick a radio, hit Start) instead of silently starting the
+    # sim. Any explicit adapter flags still run the gate directly (and the launcher
+    # spawns children WITH flags, so no recursion).
+    if not raw or "--setup" in raw:
+        from .setup import main as setup_main
+        return setup_main()
+
     ap = argparse.ArgumentParser(prog="aether_gate",
                                  description="Universal radio bridge - presents any radio to AetherSDR as a Flex 6000.")
     ap.add_argument("--adapter", default="sim", choices=available(),
