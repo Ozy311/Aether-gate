@@ -1947,6 +1947,51 @@ def live_test_set(paused=None, abort=False):
 # ---- radio diagnostics page: "what the gate sees from the radio" ----
 # Radio-agnostic: renders whatever keys diagnostics() returns, so Icom/Kenwood/
 # Yaesu/SDR adapters all light it up with what each one knows. Polls /diagnostics.
+RX2_FLAG_HTML = """<!DOCTYPE html><html><head><meta charset=utf-8>
+<title>RX2</title>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>
+ html,body{margin:0;height:100%}
+ body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0d1117;color:#e6edf3;
+      display:flex;flex-direction:column;justify-content:center;align-items:center;
+      padding:10px;box-sizing:border-box;-webkit-user-select:none;user-select:none}
+ .lbl{color:#8b949e;font-size:11px;letter-spacing:2px;text-transform:uppercase}
+ .freq{font-size:30px;font-weight:600;color:#58a6ff;line-height:1.1;margin:2px 0}
+ .freq.stale{color:#6e7681}
+ .mode{font-size:15px;color:#adbac7;margin-bottom:8px}
+ .meta{font-size:10px;color:#6e7681;margin-bottom:8px}
+ button{background:#238636;color:#fff;border:0;border-radius:6px;padding:7px 14px;
+        font-size:13px;cursor:pointer;font-family:inherit}
+ button:hover{background:#2ea043} button:disabled{background:#30363d;color:#8b949e;cursor:default}
+ .off{color:#f85149;font-size:14px}
+</style></head><body>
+ <div class=lbl>RX2 (sub receiver)</div>
+ <div id=freq class="freq stale">--</div>
+ <div id=mode class=mode>&nbsp;</div>
+ <div id=meta class=meta>&nbsp;</div>
+ <button id=btn onclick=refresh()>Refresh RX2</button>
+ <div class=meta style="margin-top:6px;max-width:180px;text-align:center">
+   reads RX2 via a receiver swap &mdash; may cause a brief scope blip</div>
+<script>
+ function fmt(hz){return hz?(hz/1e6).toFixed(4)+' MHz':'--';}
+ function show(d,fresh){
+   var f=document.getElementById('freq'),m=document.getElementById('mode'),e=document.getElementById('meta');
+   if(!d||!d.present){f.textContent='off';f.className='freq stale';m.innerHTML='&nbsp;';
+     e.textContent='no 2nd receiver';return;}
+   f.textContent=fmt(d.freq_hz);f.className='freq'+(fresh?'':' stale');
+   m.textContent=d.mode||'';
+   e.textContent=fresh?'just read':'last known - click Refresh';
+ }
+ async function state(){try{show(await (await fetch('/rx2/state')).json(),false);}catch(e){}}
+ async function refresh(){
+   var b=document.getElementById('btn');b.disabled=true;b.textContent='reading...';
+   try{var d=await (await fetch('/rx2/refresh')).json();show(d,d.ok);}catch(e){}
+   b.disabled=false;b.textContent='Refresh RX2';
+ }
+ state(); setInterval(state,4000);   // reflect the cache; the SWAP only fires on the button
+</script></body></html>"""
+
+
 RADIO_DIAG_HTML = """<!DOCTYPE html><html><head><meta charset=utf-8>
 <title>Aether-gate - radio diagnostics</title>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -2328,6 +2373,26 @@ def start_control_server(radio, port):
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers(); self.wfile.write(RADIO_DIAG_HTML.encode()); return
+            # ---- RX2 breakout window (stationary, draggable-anywhere flag) ----
+            # RX2 (the 9700's 2nd receiver) has no waterfall and can't be a live
+            # slice (the 07 B0 swap to read it is destructive). This little page
+            # is a SEPARATE window you park wherever you like; it shows RX2's
+            # freq/mode and a Refresh button that fires the ONE on-demand swap.
+            if u.path == "/rx2":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers(); self.wfile.write(RX2_FLAG_HTML.encode()); return
+            if u.path == "/rx2/state":
+                a = radio.adapter
+                if a is not None and hasattr(a, "rx2_readout"):
+                    return self._json(a.rx2_readout())
+                return self._json({"present": False, "error": "no RX2 adapter"})
+            if u.path == "/rx2/refresh":
+                a = radio.adapter
+                if a is not None and hasattr(a, "rx2_refresh"):
+                    return self._json(a.rx2_refresh())
+                return self._json({"ok": False, "error": "no RX2 adapter"})
             # ---- test-bench routes (JSON / report files) ----
             if u.path == "/fixtures":
                 return self._json(list_fixtures())

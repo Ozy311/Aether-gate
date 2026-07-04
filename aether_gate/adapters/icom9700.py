@@ -580,6 +580,33 @@ class Icom9700Adapter(RadioAdapter):
     def sub_mode(self):
         return self._civ.rx2_mode if self._civ else None
 
+    def rx2_readout(self):
+        """Cached RX2 state for the breakout display (no radio access)."""
+        civ = self._civ
+        return {
+            "present": bool(civ and civ.rx2_present),
+            "freq_hz": (civ.rx2_freq_hz if civ else None),
+            "mode": (civ.rx2_mode if civ else None),
+            "last_read_mono": getattr(self, "_rx2_read_at", None),
+        }
+
+    def rx2_refresh(self):
+        """ON-DEMAND RX2 read — the ONLY place the destructive 07 B0 swap fires
+        now (behind the breakout window's Refresh button, so it never surprises
+        the operator mid-QSO). One swap-read, updates the cache, returns it.
+        See sub_active()/_open() for why this is not done automatically."""
+        civ = self._civ
+        if not civ:
+            return {"ok": False, "error": "no radio session"}
+        try:
+            civ.swap_read_rx2()
+            self._rx2_read_at = time.monotonic()
+            r = self.rx2_readout()
+            r["ok"] = True
+            return r
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def set_sub_freq_hz(self, hz):
         """Tune the REAL 2nd receiver (RX2) via the 07 B0 swap — NOT 25 01 (that
         tuned RX1's VFO B, so AE's slice-B tune reverted). The swap-write blocks
