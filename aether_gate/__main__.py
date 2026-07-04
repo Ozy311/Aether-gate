@@ -43,7 +43,8 @@ def build_adapter(name, args):
         return cls(radio_ip=args.radio_ip, username=args.user, password=args.pw,
                    local_ip=args.radio_local_ip, radio_port=args.radio_port,
                    civ_addr=int(str(args.civ_addr), 16), model=model,
-                   serial=serial, station=station)
+                   serial=serial, station=station,
+                   usb_civ_port=args.usb_civ_port, usb_civ_baud=args.usb_civ_baud)
     if name == "kenwood":
         serial = args.serial if args.serial != "GATE0001" else "GATEKENW"
         # include the actual Kenwood model so the AE chooser reads e.g.
@@ -103,6 +104,8 @@ def main(argv=None):
     ap.add_argument("--radio-port", type=int, default=50001, help="icom9700 adapter: control port (default 50001)")
     ap.add_argument("--radio-local-ip", default=None, help="icom9700 adapter: local IP that reaches the radio (default: autodetect; set when the radio LAN differs from --ip, e.g. gate advertised on Tailscale but radio on the LAN)")
     ap.add_argument("--civ-addr", default="A2", help="icom9700 adapter: radio CI-V address hex (default A2)")
+    ap.add_argument("--usb-civ-port", default=None, help="icom9700 adapter: USB CI-V serial port (e.g. COM7 or /dev/ttyUSB0 — the 9700's _A port). Enables HYBRID dual-RX: RX2 read/tuned over USB (safe swap) while LAN carries MAIN's waterfall. Omit = MAIN-only.")
+    ap.add_argument("--usb-civ-baud", type=int, default=115200, help="icom9700 adapter: USB CI-V baud (9700 default 115200)")
     # kenwood adapter options (hamlib control + IF-tap SDR spectrum; reuses --soapy-*/--gain/--samp-rate)
     ap.add_argument("--kw-model", default="TS-2000", help="kenwood adapter: Kenwood model (TS-2000/TS-590SG/TS-890S)")
     ap.add_argument("--rigctld-host", default="127.0.0.1", help="kenwood adapter: rigctld daemon host")

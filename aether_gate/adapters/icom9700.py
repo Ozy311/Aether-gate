@@ -239,10 +239,14 @@ class _Ic9700Stream(Ic9700Civ):
         self._tune_evt.set()
 
     def _tuner_loop(self):
-        # Chases self._tune_target; intermediate drag positions coalesce away.
-        # Cross-band recipe proven on HW 2026-07-01 (dev/ic9700_xband2):
-        # 25 00 tunes same-band and any UNHELD band; a band parked on the
-        # SUB receiver is refused (FA) — swap main/sub (07 B0) and retry.
+        # Chases self._tune_target for MAIN (25 00). Intermediate drag positions
+        # coalesce away.
+        # ⚠ SINGLE-SWAPPER RULE: the LAN channel must NEVER issue 07 B0. The swap
+        # is GLOBAL to the radio (proven 2026-07-03) — two masters swapping (LAN
+        # tuner + USB RX2) collide and tangle MAIN/RX2. So ALL swaps live on the
+        # USB channel now. If a MAIN tune is FA'd because the target band is
+        # parked on the SUB receiver, the LAN tuner simply gives up (cross-band
+        # tuning is the USB channel's job); it does NOT swap.
         print(f"[tuner] loop running (_run={self._run})", flush=True)
         while self._run:
             self._tune_evt.wait(timeout=0.5)
@@ -258,22 +262,11 @@ class _Ic9700Stream(Ic9700Civ):
                     self._tune_target = None
                 continue
             ok = self._try_freq(tgt)
-            print(f"[tuner] 25 00 {tgt/1e6:.5f} -> {'FB' if ok else 'FA'}", flush=True)
+            print(f"[tuner] 25 00 {tgt/1e6:.5f} -> {'FB' if ok else 'FA (no swap; USB owns cross-band)'}", flush=True)
             if ok:
                 self.freq_hz = tgt
-                if self._tune_target == tgt:
-                    self._tune_target = None    # done — release the rig
-                continue
-            if self._tune_target != tgt:
-                continue                        # target moved on — chase that instead
-            print("[tuner] band held by SUB -> 07 B0 swap + retry", flush=True)
-            self._send_civ(bytes([0x07, 0xB0]))  # swap main/sub, then retry
-            time.sleep(0.4)
-            if self._try_freq(tgt):
-                self.freq_hz = tgt
-                print(f"[tuner] tuned {tgt/1e6:.5f} after swap", flush=True)
             if self._tune_target == tgt:
-                self._tune_target = None        # chased once, win or lose — never re-fight
+                self._tune_target = None        # chased once, win or lose — never re-fight, never swap
 
     def set_mode_civ(self, mode_byte, filt=0x01):
         self._send_civ(bytes([0x06, mode_byte, filt]))
@@ -289,7 +282,8 @@ class Icom9700Adapter(RadioAdapter):
 
     def __init__(self, radio_ip, username, password, local_ip=None,
                  radio_port=50001, civ_addr=0xA2, model="FLEX-6700",
-                 serial="GATE9700", station="Aether-gate IC-9700"):
+                 serial="GATE9700", station="Aether-gate IC-9700",
+                 usb_civ_port=None, usb_civ_baud=115200):
         # FLEX-6700 is the only Flex model that covers 2m (~135-165 MHz), so AE will
         # offer the IC-9700's 2m band. (6300/6400/6600 = HF+6m only.) 70cm/23cm still
         # need frequency translation - no Flex covers them.
@@ -311,6 +305,14 @@ class Icom9700Adapter(RadioAdapter):
                                         bands=("2m", "440", "23cm"))
         self._handler = None
         self._civ = None
+        # HYBRID RX2: optional USB CI-V channel. RX2 needs the 07 B0 swap, which
+        # is destructive over LAN (yanks the scope) but HARMLESS over USB (no
+        # scope stream) — proven 5/5 on HW 2026-07-03. When a USB CI-V port is
+        # given, RX2 is read/controlled over USB while the LAN channel keeps
+        # MAIN's waterfall. Without it, dual-RX stays off (MAIN-only).
+        self.usb_civ_port = usb_civ_port
+        self.usb_civ_baud = usb_civ_baud
+        self._usb = None
         self._span_half_hz = 500_000      # what the scope is set to (± half-width)
         self._span_sent_at = 0.0
         self._smeter_sent_at = 0.0        # rate-limit the 15 02 poll (10 Hz like SDR9700)
@@ -366,7 +368,20 @@ class Icom9700Adapter(RadioAdapter):
                                "wait ~40s and retry")
         print(f"[civ] stream healthy (freq={self._civ.freq_hz/1e6:.4f} MHz, "
               f"{self._civ.frames} scope frames)", flush=True)
-        # DUAL-RX (RX2) is PARKED — MAIN-only for now. The 07 B0 swap-read that
+        # HYBRID RX2 over USB — if a USB CI-V port was given, bring it up. The
+        # 07 B0 swap to reach RX2 is harmless here (no scope stream on USB), so
+        # its background poller tracks RX2 live without touching the LAN scope.
+        if self.usb_civ_port:
+            from .icom.usbciv import UsbCiv
+            self._usb = UsbCiv(self.usb_civ_port, self.usb_civ_baud, self.civ_addr)
+            if self._usb.start():
+                print(f"[usb] RX2 channel up on {self.usb_civ_port} "
+                      f"(MAIN={(self._usb.main_freq_hz or 0)/1e6:.4f})", flush=True)
+            else:
+                print(f"[usb] RX2 channel FAILED: {self._usb.last_err} "
+                      f"-> MAIN-only", flush=True)
+                self._usb = None
+        # DUAL-RX (RX2) over the LAN swap is PARKED — MAIN-only unless USB above. The 07 B0 swap-read that
         # reaches RX2 physically moves the operating receiver AND races the
         # radio's transceive broadcasts (cmd 0x00), which corrupted MAIN's freq
         # (slice A/B swapped) and worsened the scope-deaf sessions on a live
@@ -385,6 +400,10 @@ class Icom9700Adapter(RadioAdapter):
         # datagram (same single-shot the SDR9700 reference does in its dtor) —
         # give it a beat to actually leave the socket before the daemon threads
         # wind down, so a fast process exit can't swallow the disconnect.
+        if self._usb:
+            try: self._usb.stop()
+            except Exception: pass
+            self._usb = None
         for obj in (self._civ, self._handler):
             try:
                 if obj:
@@ -429,18 +448,28 @@ class Icom9700Adapter(RadioAdapter):
 
     # --- control (AE -> radio) -----------------------------------------
     def retune(self, center_hz):
-        if not self._civ:
-            return
+        # MAIN tune. Over USB (single source of truth) write 25 00 with NO swap
+        # — off-thread so the engine command path isn't blocked. Over LAN-only,
+        # use the LAN async tuner.
         mhz = center_hz / 1e6
         if not any(lo <= mhz <= hi for lo, hi in self.BAND_RANGES_MHZ):
             print(f"[tuner] ignoring out-of-range target {mhz:.4f} MHz "
                   f"(rig covers 2m/70cm/23cm)", flush=True)
             return
-        self._civ.set_freq_hz(int(center_hz))
+        if self._usb:
+            self._usb.main_freq_hz = int(center_hz)        # optimistic
+            threading.Thread(target=self._usb.tune_main, args=(int(center_hz),),
+                             daemon=True, name="ic9700-main-tune").start()
+        elif self._civ:
+            self._civ.set_freq_hz(int(center_hz))
 
     def set_mode(self, mode):
         mb = MODE_TO_CIV.get((mode or "").upper())
-        if mb is not None and self._civ:
+        if mb is None:
+            return
+        if self._usb:
+            self._usb.set_main_mode(mb)
+        elif self._civ:
             self._civ.set_mode_civ(mb)
 
     def set_span(self, span_hz):
@@ -526,9 +555,10 @@ class Icom9700Adapter(RadioAdapter):
         return Meters(s_meter_dbm=dbm)
 
     def initial_center_hz(self):
-        # The freq read (CI-V 03) is fired at stream-open; its reply lands
-        # asynchronously — wait briefly so the engine can seed AE on the
-        # rig's real band instead of the sim default.
+        # Seed AE on the rig's real MAIN band. Prefer USB (the truth source);
+        # it's read at connect in _open() so it's ready. Fall back to LAN.
+        if self._usb and self._usb.main_freq_hz:
+            return float(self._usb.main_freq_hz)
         end = time.monotonic() + 3.0
         while time.monotonic() < end:
             if self._civ and self._civ.freq_hz:
@@ -537,13 +567,24 @@ class Icom9700Adapter(RadioAdapter):
         return None
 
     def initial_mode(self):
+        if self._usb and self._usb.main_mode:
+            return self._usb.main_mode
         return self._civ.mode if self._civ else None
 
     # --- radio -> AE (engine polls these each second) --------------------
+    # SINGLE SOURCE OF TRUTH: when the USB channel is present it owns ALL
+    # freq/mode for BOTH receivers (MAIN + RX2). The LAN channel then does ONLY
+    # the scope waterfall — it never drives freq — so the two CI-V masters can't
+    # race over the selected receiver (the tangle that put both slices on one
+    # band). Without USB, fall back to the LAN reads (MAIN-only).
     def radio_freq_hz(self):
+        if self._usb:
+            return self._usb.main_freq_hz
         return self._civ.freq_hz if self._civ else None
 
     def radio_mode(self):
+        if self._usb:
+            return self._usb.main_mode
         return self._civ.mode if self._civ else None
 
     def receivers(self):
@@ -557,49 +598,49 @@ class Icom9700Adapter(RadioAdapter):
         the scope. The engine still stacks slice 1 on its own pan."""
         if not self._civ:
             return []
-        out = [{"freq_hz": self._civ.freq_hz, "mode": self._civ.mode}]
-        if self.sub_active():
-            out.append({"freq_hz": self._civ.rx2_freq_hz, "mode": self._civ.rx2_mode})
+        # MAIN + RX2 both from USB (single source of truth) when present.
+        if self._usb:
+            out = [{"freq_hz": self._usb.main_freq_hz, "mode": self._usb.main_mode}]
+            if self.sub_active():
+                out.append({"freq_hz": self._usb.rx2_freq_hz, "mode": self._usb.rx2_mode})
+        else:
+            out = [{"freq_hz": self._civ.freq_hz, "mode": self._civ.mode}]
         return [r for r in out if r["freq_hz"]]
 
     # --- dual-receiver (RX2) — drives the second slice -------------------
     def sub_active(self):
-        """PARKED — always False (MAIN-only). Reaching RX2 needs the destructive
-        07 B0 swap (moves the operating receiver + races transceive broadcasts +
-        stresses the fragile scope stream), which on a live gate swapped slices
-        A/B and worsened deaf sessions. RX2 has no waterfall regardless. The RX2
-        machinery (rx2_present/swap_read_rx2/write_rx2_freq) is retained for a
-        future dual-RX/Doppler project but not used. Re-enabling requires the two
-        fixes noted at the end of _open(). For now the gate presents ONE slice =
-        the SELECTED (MAIN) receiver, which is rock-solid."""
-        return False
+        """True when RX2 is present — sourced from the USB CI-V channel (safe
+        07 B0 swap), NOT the LAN swap (destructive, parked). MAIN-only if no USB
+        channel. The USB poller keeps rx2_present live without touching the scope."""
+        return bool(self._usb and self._usb.rx2_present and self._usb.rx2_freq_hz)
 
     def sub_freq_hz(self):
-        return self._civ.rx2_freq_hz if self._civ else None
+        return self._usb.rx2_freq_hz if self._usb else None
 
     def sub_mode(self):
-        return self._civ.rx2_mode if self._civ else None
+        return self._usb.rx2_mode if self._usb else None
 
     def rx2_readout(self):
-        """Cached RX2 state for the breakout display (no radio access)."""
-        civ = self._civ
+        """Cached RX2 state for the breakout display — now from the USB channel
+        (the safe swap-read source). No radio access here (just the cache)."""
+        u = self._usb
         return {
-            "present": bool(civ and civ.rx2_present),
-            "freq_hz": (civ.rx2_freq_hz if civ else None),
-            "mode": (civ.rx2_mode if civ else None),
+            "present": bool(u and u.rx2_present),
+            "freq_hz": (u.rx2_freq_hz if u else None),
+            "mode": (u.rx2_mode if u else None),
+            "usb": bool(u),
             "last_read_mono": getattr(self, "_rx2_read_at", None),
         }
 
     def rx2_refresh(self):
-        """ON-DEMAND RX2 read — the ONLY place the destructive 07 B0 swap fires
-        now (behind the breakout window's Refresh button, so it never surprises
-        the operator mid-QSO). One swap-read, updates the cache, returns it.
-        See sub_active()/_open() for why this is not done automatically."""
-        civ = self._civ
-        if not civ:
-            return {"ok": False, "error": "no radio session"}
+        """ON-DEMAND RX2 read over the USB channel (safe swap — no scope stream
+        to disturb). The USB poller already refreshes RX2 in the background; this
+        is the breakout window's manual 'read now'."""
+        u = self._usb
+        if not u:
+            return {"ok": False, "error": "no USB RX2 channel (pass --usb-civ-port)"}
         try:
-            civ.swap_read_rx2()
+            u.read_rx2()
             self._rx2_read_at = time.monotonic()
             r = self.rx2_readout()
             r["ok"] = True
@@ -608,16 +649,13 @@ class Icom9700Adapter(RadioAdapter):
             return {"ok": False, "error": str(e)}
 
     def set_sub_freq_hz(self, hz):
-        """Tune the REAL 2nd receiver (RX2) via the 07 B0 swap — NOT 25 01 (that
-        tuned RX1's VFO B, so AE's slice-B tune reverted). The swap-write blocks
-        briefly, so run it off-thread to keep the engine command path free; it
-        updates the rx2_freq_hz cache optimistically so receivers() won't snap
-        AE back before the write lands."""
-        civ = self._civ
-        if not civ:
+        """Tune RX2 over the USB channel (safe swap). Off-thread so the engine
+        command path isn't blocked; UsbCiv.write_rx2 updates its cache."""
+        u = self._usb
+        if not u:
             return
-        civ.rx2_freq_hz = int(hz)                          # optimistic (pre-write)
-        threading.Thread(target=civ.write_rx2_freq, args=(int(hz),),
+        u.rx2_freq_hz = int(hz)                            # optimistic
+        threading.Thread(target=u.write_rx2, args=(int(hz),),
                          daemon=True, name="ic9700-rx2-tune").start()
 
     # --- diagnostics: 'what the gate sees from the radio' (web panel) -----
