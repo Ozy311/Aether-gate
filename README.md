@@ -16,10 +16,13 @@ radio chooser with a live panadapter and waterfall.
   <br><em>An Icom IC-9700 bridged into AetherSDR — offered exactly the bands it can tune.</em>
 </p>
 
-> **Status:** working. Proven end-to-end on real hardware — an Icom IC-9700 (LAN,
-> 2m/70cm/23cm) and a Kenwood TS-450S (CAT + SDR dongle for spectrum) both run live
-> in AetherSDR with waterfall and control. A Raspberry Pi runs both at once as a
-> boot-time appliance. Licensed **GPL-3.0-or-later**.
+> **Status:** working, but **very young.** Proven end-to-end on real hardware — an
+> Icom IC-9700 (LAN, 2m/70cm/23cm) and a Kenwood TS-450S (CAT + SDR dongle for
+> spectrum) both run live in AetherSDR with waterfall and control, and a Raspberry Pi
+> runs both at once as a boot-time appliance. That said, this is early software:
+> **expect a few growing pains** — rough edges, radios not yet covered, and things
+> that need broader testing than one bench can give. Bug reports, fixes, and new radio
+> adapters are all very welcome. Licensed **GPL-3.0-or-later**.
 
 ---
 
@@ -184,8 +187,25 @@ python -m aether_gate.tests.test_hamlib
 
 ---
 
+## Credits
+
+Aether-gate stands on other people's work:
+
+- **The Icom IC-9700 LAN support would not exist without Justin, W5JWP.** The gate's
+  entire Icom RS-BA1 / CI-V-over-LAN transport — the discovery, login/token
+  handshake, the ping/keepalive cadence, the CI-V framing, and the band-scope
+  decoding — is **derived from his GPL-3.0 project
+  [w5jwp/SDR9700](https://github.com/w5jwp/SDR9700)**. That project reverse-engineered
+  and documented the protocol the hard way; this gate is only possible because he did
+  that work and released it openly. Attribution and license headers are preserved on
+  every derived file. Thank you, Justin. 🙏
+- The FlexRadio-emulation core (discovery, FlexLib control, VITA-49 streaming) comes
+  from [flex-sim](https://github.com/nigelfenton/flex-sim).
+- CAT control is [Hamlib](https://hamlib.github.io/); dongle spectrum is
+  [SoapySDR](https://github.com/pothosware/SoapySDR).
+
 ## License
 
-GPL-3.0-or-later. The Icom LAN transport is derived from the GPL-3.0 project
-[w5jwp/SDR9700](https://github.com/w5jwp/SDR9700); attribution and license headers are
-preserved on the derived files.
+GPL-3.0-or-later. Because the Icom transport is derived from the GPL-3.0
+[w5jwp/SDR9700](https://github.com/w5jwp/SDR9700), the whole of Aether-gate is
+GPL-3.0-or-later; the derived files carry SDR9700's copyright and license headers.

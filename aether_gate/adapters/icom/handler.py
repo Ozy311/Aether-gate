@@ -1,7 +1,7 @@
 #
 # Aether-gate — IC-9700 LAN control-stream handler (auth state machine).
 # Copyright (C) 2026 Nigel Fenton (G0JKN). GPL-3.0-or-later.
-# Ported from github.com/w5jwp/SDR9700 (GPL-3.0): UdpHandler.cpp. Attribution preserved.
+# Ported from github.com/w5jwp/SDR9700 (GPL-3.0) by Justin W5JWP: UdpHandler.cpp. Attribution preserved.
 #
 """Control-stream auth: discovery -> login -> token -> capabilities -> conninfo,
 yielding the radio-assigned civ/audio ports. Built on the threaded UdpBase so the

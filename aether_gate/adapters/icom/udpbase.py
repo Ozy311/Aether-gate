@@ -1,7 +1,7 @@
 #
 # Aether-gate — IC-9700 LAN UDP base: reliability layer + timers.
 # Copyright (C) 2026 Nigel Fenton (G0JKN). GPL-3.0-or-later.
-# Ported from github.com/w5jwp/SDR9700 (GPL-3.0): UdpBase.cpp/.h. Attribution preserved.
+# Ported from github.com/w5jwp/SDR9700 (GPL-3.0) by Justin W5JWP: UdpBase.cpp/.h. Attribution preserved.
 #
 """Shared UDP transport for the IC-9700 LAN protocol (control / CI-V / audio streams).
 

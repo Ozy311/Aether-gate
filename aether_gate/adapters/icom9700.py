@@ -1,7 +1,7 @@
 #
 # Aether-gate - Icom9700Adapter: present an IC-9700 (LAN/CI-V) to AE as a Flex.
 # Copyright (C) 2026 Nigel Fenton (G0JKN). GPL-3.0-or-later.
-# Built on the icom/ LAN transport ported from github.com/w5jwp/SDR9700 (GPL-3.0).
+# Built on the icom/ LAN transport ported from github.com/w5jwp/SDR9700 (GPL-3.0) by Justin W5JWP.
 #
 """RadioAdapter for the Icom IC-9700 over its LAN interface (provides="spectrum").
 
