@@ -285,7 +285,7 @@ class Icom9700Adapter(RadioAdapter):
 
     def __init__(self, radio_ip, username, password, local_ip=None,
                  radio_port=50001, civ_addr=0xA2, model="FLEX-6700",
-                 serial="GATE9700", station="Aether-gate IC-9700",
+                 serial="GATE9700", station="Icom-IC-9700",
                  usb_civ_port=None, usb_civ_baud=115200):
         # FLEX-6700 is the only Flex model that covers 2m (~135-165 MHz), so AE will
         # offer the IC-9700's 2m band. (6300/6400/6600 = HF+6m only.) 70cm/23cm still
