@@ -66,6 +66,8 @@ class UdpBase:
         self.n_sent = 0                  # tracked packets we've sent
         self.n_retx_req = 0              # retransmit REQUESTS we've sent to the radio
         self.n_rx_clears = 0             # times the RX seq tracker reset (gap/rollover)
+        self.n_rx_dgrams = 0             # ALL datagrams received from the radio
+        self.last_rx_at = 0.0            # monotonic time of the last radio datagram
         # subclasses set this to a callable(packet_bytes) for non-control payloads
         self.on_data = None
 
@@ -73,7 +75,7 @@ class UdpBase:
     def _send(self, data):
         try:
             self.sock.sendto(data, (self.radio_ip, self.radio_port))
-        except OSError:
+        except (OSError, AttributeError):      # AttributeError: sock closed to None by stop()
             pass
 
     def _control(self, typ, seq=0, ln=CONTROL_SIZE):
@@ -125,6 +127,15 @@ class UdpBase:
             self.send_control(0x05, 0x00)  # disconnect/idle close
         except Exception:
             pass
+        # Close the socket fd. Without this each reconnect leaked the civ/audio
+        # sockets (they were left bound + unread — visible as orphaned sockets
+        # with a stuck Recv-Q). The reader thread already exited on _run=False.
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
 
     # --- timer thread (the cadence the radio needs) -----------------------
     def _timer_loop(self):
@@ -177,8 +188,15 @@ class UdpBase:
                 d = self.sock.recvfrom(4096)[0]
             except socket.timeout:
                 continue
-            except OSError:
+            except (OSError, AttributeError):  # closed / set to None by stop()
                 break
+            # Ground-truth instrumentation for the deaf-scope stall: count EVERY
+            # datagram the radio sends us + when the last one arrived. If these
+            # keep climbing through a scope stall, the radio is still talking and
+            # the gate is dropping/ignoring scope frames; if they freeze, the
+            # radio itself went silent. (No packet-capture tool on the Pi.)
+            self.n_rx_dgrams += 1
+            self.last_rx_at = time.monotonic()
             if len(d) < CONTROL_SIZE:
                 continue
             typ = struct.unpack("<H", d[4:6])[0]
