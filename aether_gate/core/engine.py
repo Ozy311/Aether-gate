@@ -817,7 +817,8 @@ class Radio:
         self.conn = None            # active TCP conn (so the control panel can push TX status)
         self.tx_mox = False         # live: TX keyed (panel toggle or AE's 'transmit set mox=1')
         self.tx_tune = False
-        self.tx_power_w = 100.0      # live: forward power (W) reported while TX
+        self.tx_power_w = 100.0      # live: measured forward power (W) -> FWDPWR meter
+        self.tx_power_level = 100     # live: RF-power SETTING 0..100 (% of max) -> rfpower field
         self.tx_swr = 1.2           # live: SWR reported while TX
         self.cwx_wpm = 20           # CWX keyer speed (AE drives via 'cwx wpm')
         self.cwx_active = False      # an AE-initiated CWX transmission is in progress
@@ -1626,15 +1627,26 @@ class Radio:
         if not self.conn:
             return
         on = self.tx_on
-        # HONEST POWER: report the rig's ACTUAL RF-power setting so AE stops
-        # showing the hardcoded 100 W. Read-only — AE's rfpower/tunepower sets are
-        # ignored (not parsed in the transmit-set handler), so power stays
-        # controlled at the rig's front panel. Keep the last value if no read yet.
-        if self.adapter is not None and hasattr(self.adapter, "radio_power_w"):
+        # HONEST POWER LEVEL: AE's rfpower/tunepower are a 0..100 PERCENT-of-max
+        # LEVEL (TxApplet setRange(0,100), 'percent of maximum') — NOT watts. Read
+        # the rig's actual power SETTING (0..100) so AE stops showing the hardcoded
+        # 100. Read-only: AE's rfpower/tunepower sets are ignored (unparsed in the
+        # transmit-set handler), so power stays set at the rig's front panel.
+        # (Measured forward WATTS are a separate thing -> the FWDPWR meter.)
+        level = int(self.tx_power_level)
+        if self.adapter is not None and hasattr(self.adapter, "radio_power_level"):
             try:
-                pw = self.adapter.radio_power_w()
-                if pw is not None:
-                    self.tx_power_w = pw
+                lv = self.adapter.radio_power_level()
+                if lv is not None:
+                    self.tx_power_level = lv
+                    level = int(lv)
+                    # Rough estimate of forward WATTS from the level for the FWDPWR
+                    # meter (band max: 100 W 2m/70cm, 10 W 23cm) so it isn't the
+                    # stale 100 W. Approximate (the low end is non-linear: 1% ~=
+                    # 0.78 W measured) — a real read needs the 15 11 TX meter.
+                    mhz = self.slice_freq
+                    band_max = 10.0 if 1200.0 <= mhz <= 1400.0 else 100.0
+                    self.tx_power_w = round(level / 100.0 * band_max, 2)
             except Exception:
                 pass
         try:
@@ -1643,9 +1655,8 @@ class Radio:
                 f"tx_client_handle=0x{self.handle_hex}")
             self.status(self.conn,
                 f"transmit mox={1 if self.tx_mox else 0} tune={1 if self.tx_tune else 0} "
-                f"freq={self.slice_freq:.6f} rfpower={int(self.tx_power_w)} "
-                f"tunepower={int(self.tx_power_w)}")
-            log(f"[->] TX {'ON' if on else 'off'}  ({self.tx_power_w:.0f} W, SWR {self.tx_swr:.1f})")
+                f"freq={self.slice_freq:.6f} rfpower={level} tunepower={level}")
+            log(f"[->] TX {'ON' if on else 'off'}  (level {level}%, SWR {self.tx_swr:.1f})")
         except OSError:
             pass
 

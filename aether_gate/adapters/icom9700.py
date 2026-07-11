@@ -897,20 +897,19 @@ class Icom9700Adapter(RadioAdapter):
             return self._echo_mode(self._usb.main_mode)
         return self._echo_mode(self._civ.mode) if self._civ else None
 
-    def radio_power_w(self):
-        """The rig's ACTUAL RF-power setting in watts (read-only, from 14 0A).
-        The 9700 does 0..100 W on 2m/70cm (0..10 W on 23cm); CI-V 14 0A reports
-        0..255 = 0..100% of that. Report % scaled to the band's max so AE's power
-        display matches the rig instead of the old hardcoded 100 W. None until a
-        reading lands (engine then keeps its previous value)."""
+    def radio_power_level(self):
+        """The rig's RF-power SETTING as a 0..100 LEVEL (read-only, from 14 0A).
+
+        AE's 'RF Power' is a 0..100 PERCENT-of-maximum level (TxApplet
+        setRange(0,100), 'percent of maximum'), NOT watts — so we report the
+        percent, not a watts conversion. CI-V 14 0A gives 0..255 = 0..100%, so
+        level = raw/255*100 (e.g. raw=3 -> 1%, which is what the rig shows and
+        what measured ~0.78 W out). Actual forward watts belong on the FWDPWR
+        meter during TX, a separate field. None until a reading lands."""
         raw = self._civ.rfpower_raw if self._civ else None
         if raw is None:
             return None
-        pct = max(0.0, min(1.0, raw / 255.0))
-        f = self._civ.freq_hz if self._civ else None
-        mhz = (f / 1e6) if f else 145.0
-        band_max_w = 10.0 if 1200.0 <= mhz <= 1400.0 else 100.0    # 23cm=10 W
-        return round(pct * band_max_w, 1)
+        return round(raw / 255.0 * 100.0)
 
     def receivers(self):
         """The active receivers as {freq_hz, mode}: MAIN first (slice 0), RX2
