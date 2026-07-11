@@ -22,7 +22,7 @@ Audio packet (0x18 = 24-byte header, then LPCM16 payload):
 import struct
 import threading
 
-from .udpbase import UdpBase
+from .udpbase import UdpBase, CONTROL_SIZE, AUDIO_SIZE
 
 AUDIO_HDR = 0x18                 # audio packet header size
 RADIO_RATE = 48000              # the rxsample we request in conninfo (handler.py)
@@ -104,7 +104,42 @@ class Ic9700Audio(UdpBase):
         # enough; the radio starts streaming audio to this port once ready.
         # (UdpBase already sent 0x06 and keeps the are-you-there/ping/idle
         # cadence via the timer thread.) Nothing to send here.
-        pass
+        self._connected = True
+
+    def _dispatch_subclass(self, r):
+        """UdpAudio::dataReceived semantic branch — the audio equivalent of
+        UdpCivData._dispatch_subclass (SDR9700 UdpAudio.cpp:284).
+
+        ⚠ WITHOUT THIS the audio session was DEAF: the base UdpBase._reader calls
+        _dispatch_subclass() (a no-op in the base) then the reliability pass, and
+        `on_data` is ONLY invoked from UdpCivData. Ic9700Audio extends bare
+        UdpBase, so before this method the arriving audio datagrams were counted
+        + seq-tracked but NEVER decoded into the ring -> the gate forwarded pure
+        SILENCE to AE even with a loud signal on the wire (regression introduced
+        by the SDR9700 transport port; the pre-port Ic9700Audio had its own
+        reader that decoded packets). Ties to [[deaf-scope-sdr9700-port-plan]].
+        """
+        length = len(r)
+        if length == CONTROL_SIZE:
+            typ = struct.unpack("<H", r[4:6])[0]
+            if typ == 0x04:
+                self._areyouthere_on = False
+            elif typ == 0x06:
+                self.remote_id = struct.unpack("<I", r[8:12])[0]
+                self._on_iamready()
+            return
+        # Audio data packet: type != 0x01 and len >= 0x20 (reference guard).
+        if length < AUDIO_SIZE:
+            return
+        typ = struct.unpack("<H", r[4:6])[0]
+        hdr_len = struct.unpack("<I", r[0:4])[0]
+        if typ == 0x01 or hdr_len < 0x20:
+            return
+        if hdr_len != length:
+            return                                  # mismatched length -> drop
+        self._mark_packet_received()
+        if self.on_data:                            # _on_audio: slices r[0x18:] itself
+            self.on_data(bytes(r))
 
     def _on_tick(self, now):
         # AUDIO SILENCE WATCHDOG (transport-audit find): SDR9700 alerts after

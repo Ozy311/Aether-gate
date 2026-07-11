@@ -437,8 +437,11 @@ class Icom9700Adapter(RadioAdapter):
                 self._audio = Ic9700Audio(lip, self.radio_ip, self._handler.audio_port,
                                           self._handler._audio_sock)
                 self._audio.start()
-                print(f"[audio] LAN RX-audio session up on port "
-                      f"{self._handler.audio_port}", flush=True)
+                # Log the LOCAL listen port (where the radio streams audio TO) —
+                # this must match the fixed audio_local_port we advertised, else
+                # the radio's remembered (stale) port wins and AE gets silence.
+                print(f"[audio] LAN RX-audio session up: radio :{self._handler.audio_port} "
+                      f"-> local :{self._handler.audio_local_port}", flush=True)
             except Exception as e:
                 self._audio = None
                 print(f"[audio] RX-audio bring-up failed: {e} (RX stays silent)", flush=True)

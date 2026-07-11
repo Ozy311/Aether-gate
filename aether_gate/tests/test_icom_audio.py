@@ -89,10 +89,46 @@ def test_get_audio_none_without_stream():
     print("ok  audio: get_audio None when no audio session")
 
 
+def test_dispatch_subclass_routes_audio_to_ring():
+    # REGRESSION: the SDR9700 transport port left Ic9700Audio (a bare UdpBase)
+    # with NO _dispatch_subclass, so arriving audio datagrams were counted but
+    # never handed to on_data -> the ring stayed empty -> AE got pure silence
+    # even with a loud signal on the wire. Pin that a full audio datagram fed to
+    # _dispatch_subclass reaches _on_audio and fills the ring.
+    import time
+    a = _fresh_audio()
+    a.on_data = a._on_audio
+    a._mono_start = time.monotonic()
+    a._last_received_ms = 0
+    pcm = struct.pack("<4h", 0, 16384, -16384, 32767)
+    a._dispatch_subclass(_audio_pkt(pcm))
+    assert a.audio_frames == 1, a.audio_frames
+    assert a.ring_samples == 4, a.ring_samples
+    print("ok  audio: _dispatch_subclass routes a data datagram to the ring")
+
+
+def test_dispatch_subclass_ignores_control_frames():
+    # A 0x10 control packet must NOT be parsed as audio (no ring growth).
+    import time
+    a = _fresh_audio()
+    a.on_data = a._on_audio
+    a._mono_start = time.monotonic()
+    a._last_received_ms = 0
+    a._areyouthere_on = True
+    a.remote_id = 0
+    ctrl = struct.pack("<IHHII", 0x10, 0x04, 0, 0, 0)   # len16, type 0x04 "I am here"
+    a._dispatch_subclass(ctrl)
+    assert a.ring_samples == 0
+    assert a._areyouthere_on is False        # 0x04 stops the are-you-there timer
+    print("ok  audio: _dispatch_subclass ignores control frames, handles 0x04")
+
+
 def main():
     tests = [test_parse_and_read_samples, test_short_read_returns_available,
              test_odd_payload_trimmed, test_get_audio_decimates_48k_to_24k,
-             test_get_audio_none_without_stream]
+             test_get_audio_none_without_stream,
+             test_dispatch_subclass_routes_audio_to_ring,
+             test_dispatch_subclass_ignores_control_frames]
     for t in tests:
         try:
             t()

@@ -38,6 +38,17 @@ from .obfuscation import obfuscate
 _LOGIN_ERROR_INVALID_CREDENTIALS = 0xFEFFFFFF
 _AREYOUTHERE_LIMIT = 20            # sendAreYouThere gives up at counter==20
 
+# FIXED local ports for the CIV + audio streams (was: ephemeral, a new random
+# port every run). The 9700 REMEMBERS the audio port from a prior session and
+# keeps streaming there even after we restart and advertise a fresh one — so an
+# ephemeral port meant a gate restart left the radio streaming audio to the OLD
+# (dead) port, nobody listening -> AE got silence (dgrams=0). Pinning stable
+# ports makes the radio's remembered port match ours across restarts, so audio
+# always lands. Chosen high + uncommon to avoid clashes; we fall back to
+# ephemeral (bind :0) if a fixed port is somehow already in use.
+_FIXED_CIV_LOCAL_PORT = 40410
+_FIXED_AUDIO_LOCAL_PORT = 40411
+
 
 class Ic9700Handler(UdpBase):
     def __init__(self, local_ip, radio_ip, radio_port, username, password,
@@ -318,15 +329,27 @@ class Ic9700Handler(UdpBase):
         struct.pack_into("<I", b, 0x1c, self.token)            # token (LE)
         self.send_tracked(bytes(b))
 
+    def _bind_local(self, fixed_port, label):
+        """Bind a UDP socket to a FIXED local port so the radio's remembered
+        stream port matches ours across gate restarts (see the module note on
+        _FIXED_*_LOCAL_PORT). Fall back to an ephemeral port if the fixed one is
+        already in use, so a port clash can never stop us connecting."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.bind((self.local_ip, fixed_port))
+        except OSError as e:
+            print(f"[ctrl] {label} fixed port {fixed_port} unavailable ({e}); "
+                  f"falling back to ephemeral", flush=True)
+            s.bind((self.local_ip, 0))
+        return s
+
     def _send_request_stream(self):
         """UdpHandler::sendRequestStream (conninfo_packet, requesttype 0x03).
         Reserves the local civ/audio ports first (setCurrentRadio reserves them
         via bound QUdpSockets); we bind two sockets and keep them for civ/audio."""
         if self.civ_local_port == 0 or self.audio_local_port == 0:
-            cs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            cs.bind((self.local_ip, 0))
-            as_ = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            as_.bind((self.local_ip, 0))
+            cs = self._bind_local(_FIXED_CIV_LOCAL_PORT, "civ")
+            as_ = self._bind_local(_FIXED_AUDIO_LOCAL_PORT, "audio")
             self.civ_local_port = cs.getsockname()[1]
             self.audio_local_port = as_.getsockname()[1]
             self._civ_sock = cs
