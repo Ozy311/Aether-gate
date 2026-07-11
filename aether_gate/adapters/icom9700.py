@@ -108,6 +108,7 @@ class _Ic9700Stream(Ic9700Civ):
         self.dualwatch = None          # 07 D2: True/False = SUB receiver active (dual-slice)
         self.smeter_raw = None         # last CI-V 15 02 reading, 0..255
         self.rfpower_raw = None         # last CI-V 14 0A RF-power SETTING, 0..255 (read-only)
+        self.fwdpwr_raw = None           # last CI-V 15 11 Po (forward-power) METER, 0..255 (TX only)
         # --- true SECOND RECEIVER (RX2) — reached ONLY via 07 B0 swap-read ---
         # 25 00/25 01 are VFO A/B of the SELECTED receiver (both belong to
         # whichever RX is MAIN); they do NOT reach RX2. Proven on HW
@@ -214,6 +215,12 @@ class _Ic9700Stream(Ic9700Civ):
                 elif cmd == 0x15 and len(data) >= 3 and data[0] == 0x02:
                     # S-meter reply: 15 02 <2-byte BCD 0000-0255>
                     self.smeter_raw = (data[1] >> 4) * 1000 + (data[1] & 0xF) * 100 + \
+                                      (data[2] >> 4) * 10 + (data[2] & 0xF)
+                elif cmd == 0x15 and len(data) >= 3 and data[0] == 0x11:
+                    # Po (forward-power) meter reply: 15 11 <2-byte BCD 0000-0255>.
+                    # Only meaningful while keyed; 0 in RX. Icom Po curve is
+                    # non-linear (see _fwd_power_w). Poll only during TX.
+                    self.fwdpwr_raw = (data[1] >> 4) * 1000 + (data[1] & 0xF) * 100 + \
                                       (data[2] >> 4) * 10 + (data[2] & 0xF)
                 elif cmd == 0x14 and len(data) >= 3 and data[0] == 0x0A:
                     # RF power SETTING reply: 14 0A <2-byte BCD 0000-0255> = 0-100%.
@@ -341,6 +348,11 @@ class _Ic9700Stream(Ic9700Civ):
         # Read the rig's RF-power SETTING (14 0A). Read-only: we report it to AE
         # so its power display is honest; AE never writes power back to the rig.
         self._send_civ(bytes([0x14, 0x0A]))
+
+    def poll_fwdpower(self):
+        # Read the Po (forward-power) METER (15 11). Only meaningful during TX;
+        # polled from read_meters ONLY while keyed so we don't flood CI-V in RX.
+        self._send_civ(bytes([0x15, 0x11]))
 
     # --- PTT (CI-V 1C 00) — the raw key primitives. The SAFETY layer lives on
     # the adapter (Icom9700Adapter.key_tx/unkey_tx): arm-gate, band-check,
@@ -702,6 +714,7 @@ class Icom9700Adapter(RadioAdapter):
                 return True                            # already keyed
             self._civ._ptt_raw(True)
             self._tx_keyed = True
+            self._civ._tx_active = True                # gate the 15 11 Po poll on
             # WATCHDOG: force-unkey after the hard cap no matter what.
             self._tx_watchdog = threading.Timer(self.TX_MAX_KEY_S, self._tx_timeout)
             self._tx_watchdog.daemon = True
@@ -719,6 +732,8 @@ class Icom9700Adapter(RadioAdapter):
             if self._civ is not None:
                 try:
                     self._civ._ptt_raw(False)
+                    self._civ._tx_active = False       # stop the 15 11 Po poll
+                    self._civ.fwdpwr_raw = None        # clear stale reading -> RX shows 0 W
                 except Exception as e:
                     print(f"[tx] unkey send error: {e}", flush=True)
             if self._tx_keyed:
@@ -800,6 +815,13 @@ class Icom9700Adapter(RadioAdapter):
         if not scope_only and now - self._smeter_sent_at >= 0.1:
             self._civ.poll_smeter()                        # 15 02 (S-meter) 10 Hz — scope keepalive
             self._smeter_sent_at = now
+        # FORWARD-POWER (15 11) — poll ~5 Hz ONLY while keyed. Gated on TX so it
+        # never adds CI-V load in RX (and the meter reads 0 in RX anyway). The
+        # adapter's key_tx/unkey_tx toggle _civ._tx_active.
+        if (not scope_only and getattr(self._civ, "_tx_active", False)
+                and now - getattr(self, "_fwd_sent_at", 0.0) >= 0.2):
+            self._civ.poll_fwdpower()                      # 15 11 (Po meter)
+            self._fwd_sent_at = now
         if now - self._freq_polled_at >= 1.0:
             self._freq_polled_at = now
             if not scope_only:
@@ -910,6 +932,30 @@ class Icom9700Adapter(RadioAdapter):
         if raw is None:
             return None
         return round(raw / 255.0 * 100.0)
+
+    # Icom Po (forward-power) meter calibration: the 0..255 CI-V reading maps
+    # NON-LINEARLY to a fraction of rated output. These breakpoints are the
+    # standard Icom Po scale (0/50/100% at raw 0/143/213), interpolated. Scaled
+    # to the band's rated max in _fwd_power_w. (Approximate; a bench cal per band
+    # would refine it, but far better than the flat level% estimate.)
+    _PO_CURVE = ((0, 0.0), (41, 0.10), (75, 0.25), (100, 0.33),
+                 (143, 0.50), (190, 0.75), (213, 1.00), (255, 1.00))
+
+    def _fwd_power_w(self):
+        """Measured forward power in WATTS from the 15 11 Po meter, or None.
+        Non-linear Icom Po curve -> fraction of rated, scaled to band max."""
+        raw = self._civ.fwdpwr_raw if self._civ else None
+        if raw is None:
+            return None
+        frac = self._PO_CURVE[-1][1]
+        for (r0, f0), (r1, f1) in zip(self._PO_CURVE, self._PO_CURVE[1:]):
+            if raw <= r1:
+                frac = f0 + (f1 - f0) * ((raw - r0) / (r1 - r0)) if r1 > r0 else f0
+                break
+        f = self._civ.freq_hz if self._civ else None
+        mhz = (f / 1e6) if f else 145.0
+        band_max = 10.0 if 1200.0 <= mhz <= 1400.0 else 100.0      # 23cm = 10 W
+        return round(frac * band_max, 2)
 
     def receivers(self):
         """The active receivers as {freq_hz, mode}: MAIN first (slice 0), RX2

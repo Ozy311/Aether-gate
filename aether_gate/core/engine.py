@@ -1997,7 +1997,17 @@ class Radio:
 
             # TX meters every frame: real power/SWR while keyed, ~0 W / 1.0 SWR when not,
             # so AE's meter decays back to zero on de-key. CW/CWX key power per element.
-            pw = self.tx_power_w if keyed else 0.0
+            # Prefer the rig's MEASURED forward power (CI-V 15 11) when the adapter
+            # can read it; fall back to the level-based estimate (tx_power_w).
+            pw = self.tx_power_w
+            if keyed and self.adapter is not None and hasattr(self.adapter, "_fwd_power_w"):
+                try:
+                    meas = self.adapter._fwd_power_w()
+                    if meas is not None:
+                        pw = meas
+                except Exception:
+                    pass
+            pw = pw if keyed else 0.0
             sw = self.tx_swr if keyed else 1.0
             fwd_dbm = 10.0 * math.log10(max(pw, 1e-6)) + 30.0
             try:
