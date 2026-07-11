@@ -806,6 +806,14 @@ class Radio:
                 log(f"[adapter] seed failed: {e!r}")
         self.slices = {}            # index -> {"freq":MHz,"mode":str,"active":bool}; AE adds via +RX (slice create)
         self.active_slice = 0       # the slice the pan/waterfall/primary carrier follow
+        # RADIO-STATE-WINS: AE persists its last slice freq/mode and re-asserts it
+        # on reconnect (a 'slice create' with AE's remembered values), which would
+        # otherwise drag the radio away from where it actually is. On the FIRST
+        # slice create after a (re)connect we override AE's remembered values with
+        # the radio's live freq/mode so the rig stays put and AE follows it. Reset
+        # per connection (see the disconnect cleanup). Later, deliberate AE tunes
+        # are honoured normally.
+        self._radio_state_claimed = False
         self.conn = None            # active TCP conn (so the control panel can push TX status)
         self.tx_mox = False         # live: TX keyed (panel toggle or AE's 'transmit set mox=1')
         self.tx_tune = False
@@ -919,6 +927,7 @@ class Radio:
                 # Without it, stale slices/pans pile up across reconnects and the slice
                 # lettering drifts (A -> B -> C on each new connection).
                 self.slices.clear(); self.pans.clear(); self.pan_seq = 0; self.active_slice = 0
+                self._radio_state_claimed = False   # next connect re-seeds from the radio
 
     def handle(self, conn):
         self.conn = conn
@@ -989,6 +998,28 @@ class Radio:
             pid = self._pan_from_kvs(kvs)                  # the panadapter this receiver lands on
             freq = float(kvs["freq"]) if "freq" in kvs else self.slice_freq
             mode = kvs.get("mode", self.slice_mode)
+            # RADIO-STATE-WINS on the first slice after (re)connect: AE re-asserts
+            # its remembered slice here; override it with the radio's ACTUAL live
+            # freq/mode so the rig stays where it (or its front panel) is, and AE
+            # follows. Only the FIRST slice, only when the adapter can report live
+            # state — subsequent deliberate AE tunes are untouched.
+            if not self._radio_state_claimed and self.adapter is not None:
+                self._radio_state_claimed = True
+                try:
+                    rhz = (self.adapter.radio_freq_hz()
+                           if hasattr(self.adapter, "radio_freq_hz") else None)
+                    rmode = (self.adapter.radio_mode()
+                             if hasattr(self.adapter, "radio_mode") else None)
+                except Exception as e:
+                    rhz = rmode = None
+                    log("[adapter] radio-state read failed on slice create:", e)
+                if rhz:
+                    freq = rhz / 1e6
+                if rmode:
+                    mode = rmode
+                if rhz or rmode:
+                    log(f"[radio-wins] slice 0 seeded from radio: {freq:.5f} MHz {mode} "
+                        f"(AE asked {kvs.get('freq','-')} {kvs.get('mode','-')})")
             for s in self.slices.values(): s["active"] = False
             self.slices[idx] = {"freq": freq, "mode": mode, "active": True, "pan": pid}
             self.pans[pid]["slice"] = idx

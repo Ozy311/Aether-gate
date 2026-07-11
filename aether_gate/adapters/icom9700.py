@@ -727,8 +727,17 @@ class Icom9700Adapter(RadioAdapter):
         return None
 
     def initial_mode(self):
+        # WAIT for the real mode read (like initial_center_hz waits for freq).
+        # Without the wait this returned None at connect (the 26 00 reply hadn't
+        # landed yet), so the engine seeded AE with its "USB" default even when
+        # the rig was on FM -> AE opened on the wrong mode. Prefer USB channel.
         if self._usb and self._usb.main_mode:
             return self._usb.main_mode
+        end = time.monotonic() + 3.0
+        while time.monotonic() < end:
+            if self._civ and self._civ.mode:
+                return self._civ.mode
+            time.sleep(0.1)
         return self._civ.mode if self._civ else None
 
     # --- radio -> AE (engine polls these each second) --------------------
