@@ -33,6 +33,31 @@ MODE_TO_CIV = {"LSB": 0x00, "USB": 0x01, "AM": 0x02, "CW": 0x03, "RTTY": 0x04,
                "FM": 0x05, "CW-R": 0x06, "RTTY-R": 0x07, "DV": 0x08, "FM-N": 0x12}
 CIV_TO_MODE = {v: k for k, v in MODE_TO_CIV.items()}
 
+# AE speaks Flex's mode vocabulary, which is a SUPERSET of the IC-9700's CI-V
+# modes: the Flex "data" variants (DFM = data-FM, DIGU/DIGL = data USB/LSB) and
+# a few aliases have no distinct CI-V mode byte on the 9700 (the 9700 has no
+# separate data-mode byte — data is just the base mode with an external audio
+# path). Fold each AE mode onto the nearest CI-V base mode so a dropdown pick
+# actually keys the radio instead of being silently dropped (which let the
+# radio->AE sync yank AE's choice straight back). The gate still ECHOES the AE
+# alias back to AE (via _ae_mode_echo) so e.g. DFM stays showing DFM even though
+# the rig sits on plain FM.
+AE_MODE_ALIASES = {
+    "DFM": "FM", "NFM": "FM", "FMN": "FM-N",          # FM family
+    "DIGU": "USB", "DIGL": "LSB",                     # data SSB -> base SSB
+    "SAM": "AM", "DSB": "AM", "AME": "AM",            # AM family
+    "DCW": "CW", "CWL": "CW-R", "CWU": "CW",          # CW family
+    "FDV": "DV",                                      # data-voice -> DV
+}
+
+
+def _civ_mode_name(ae_mode):
+    """AE mode string -> the CI-V base mode name the 9700 understands (or None
+    if there's genuinely no equivalent). Applies the Flex->Icom alias fold."""
+    m = (ae_mode or "").upper()
+    m = AE_MODE_ALIASES.get(m, m)
+    return m if m in MODE_TO_CIV else None
+
 
 def _encode_bcd(hz):
     """Hz -> 5 CI-V BCD bytes, LSB digit-pair first."""
@@ -544,9 +569,19 @@ class Icom9700Adapter(RadioAdapter):
             self._civ.set_freq_hz(int(center_hz))
 
     def set_mode(self, mode):
-        mb = MODE_TO_CIV.get((mode or "").upper())
+        # Fold AE's Flex mode (incl. data variants: DFM/DIGU/DIGL) onto the
+        # nearest CI-V base mode the 9700 can key. Remember the exact AE string
+        # so radio_mode()/receivers() can echo it back verbatim — otherwise AE
+        # picks DFM, the rig goes to plain FM, the radio->AE sync reports "FM",
+        # and AE's display snaps DFM back to FM.
+        base = _civ_mode_name(mode)
+        mb = MODE_TO_CIV.get(base) if base else None
         if mb is None:
+            print(f"[mode] AE asked for {mode!r} - no CI-V equivalent on the 9700, ignored",
+                  flush=True)
             return
+        self._ae_mode_echo = (mode or "").upper()          # what AE should keep showing
+        self._ae_mode_base = base                          # the CI-V base it maps to
         if self._usb:
             self._usb.set_main_mode(mb)
         elif self._civ:
@@ -693,10 +728,22 @@ class Icom9700Adapter(RadioAdapter):
             return self._usb.main_freq_hz
         return self._civ.freq_hz if self._civ else None
 
+    def _echo_mode(self, radio_mode):
+        """Map the rig's actual (CI-V base) mode back to the AE string to report.
+        If AE last asked for a data variant (DFM/DIGU/...) and the rig is still on
+        the base mode that variant folds to, report the AE alias so its display
+        keeps the data mode. If the rig's base mode has since diverged (a
+        front-panel change), report the rig's real mode so that reaches AE too."""
+        echo = getattr(self, "_ae_mode_echo", None)
+        base = getattr(self, "_ae_mode_base", None)
+        if echo and base and radio_mode == base:
+            return echo
+        return radio_mode
+
     def radio_mode(self):
         if self._usb:
-            return self._usb.main_mode
-        return self._civ.mode if self._civ else None
+            return self._echo_mode(self._usb.main_mode)
+        return self._echo_mode(self._civ.mode) if self._civ else None
 
     def receivers(self):
         """The active receivers as {freq_hz, mode}: MAIN first (slice 0), RX2
@@ -710,12 +757,16 @@ class Icom9700Adapter(RadioAdapter):
         if not self._civ:
             return []
         # MAIN + RX2 both from USB (single source of truth) when present.
+        # MAIN mode goes through _echo_mode so a data variant AE picked (DFM/
+        # DIGU/...) is reported back as that variant, not the rig's coarser base.
         if self._usb:
-            out = [{"freq_hz": self._usb.main_freq_hz, "mode": self._usb.main_mode}]
+            out = [{"freq_hz": self._usb.main_freq_hz,
+                    "mode": self._echo_mode(self._usb.main_mode)}]
             if self.sub_active():
                 out.append({"freq_hz": self._usb.rx2_freq_hz, "mode": self._usb.rx2_mode})
         else:
-            out = [{"freq_hz": self._civ.freq_hz, "mode": self._civ.mode}]
+            out = [{"freq_hz": self._civ.freq_hz,
+                    "mode": self._echo_mode(self._civ.mode)}]
         return [r for r in out if r["freq_hz"]]
 
     # --- dual-receiver (RX2) — drives the second slice -------------------

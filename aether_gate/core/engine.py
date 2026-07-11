@@ -1401,7 +1401,13 @@ class Radio:
             return
 
         def _mode(m):
-            return m if m in ("LSB", "USB", "AM", "CW", "FM", "RTTY", "DV") else "FM"
+            # Pass through the base modes AND the Flex data variants an adapter
+            # may echo back (DFM/DIGU/DIGL/...) so AE's data-mode display isn't
+            # collapsed to plain FM. Anything genuinely unknown still falls back
+            # to a safe default rather than emitting a mode AE would reject.
+            KNOWN = ("LSB", "USB", "AM", "CW", "CW-R", "FM", "FM-N", "RTTY",
+                     "RTTY-R", "DV", "DFM", "NFM", "DIGU", "DIGL", "SAM")
+            return m if m in KNOWN else "FM"
 
         # CONTINUITY MATCH: assign each receiver reading to the slice it's
         # closest to (0=primary/MAIN, 1=SUB), so a "selected" flip-flop can't
