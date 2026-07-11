@@ -107,6 +107,7 @@ class _Ic9700Stream(Ic9700Civ):
         self.other_mode = None         # UNSELECTED (SUB) vfo mode (26 01) — same-rx VFO B
         self.dualwatch = None          # 07 D2: True/False = SUB receiver active (dual-slice)
         self.smeter_raw = None         # last CI-V 15 02 reading, 0..255
+        self.rfpower_raw = None         # last CI-V 14 0A RF-power SETTING, 0..255 (read-only)
         # --- true SECOND RECEIVER (RX2) — reached ONLY via 07 B0 swap-read ---
         # 25 00/25 01 are VFO A/B of the SELECTED receiver (both belong to
         # whichever RX is MAIN); they do NOT reach RX2. Proven on HW
@@ -214,6 +215,12 @@ class _Ic9700Stream(Ic9700Civ):
                     # S-meter reply: 15 02 <2-byte BCD 0000-0255>
                     self.smeter_raw = (data[1] >> 4) * 1000 + (data[1] & 0xF) * 100 + \
                                       (data[2] >> 4) * 10 + (data[2] & 0xF)
+                elif cmd == 0x14 and len(data) >= 3 and data[0] == 0x0A:
+                    # RF power SETTING reply: 14 0A <2-byte BCD 0000-0255> = 0-100%.
+                    # Read-only here (we report it to AE; AE cannot set it back —
+                    # power stays controlled at the rig's front panel).
+                    self.rfpower_raw = (data[1] >> 4) * 1000 + (data[1] & 0xF) * 100 + \
+                                       (data[2] >> 4) * 10 + (data[2] & 0xF)
                 elif cmd == 0xFB:
                     self.n_fb += 1
                 elif cmd == 0xFA:
@@ -329,6 +336,11 @@ class _Ic9700Stream(Ic9700Civ):
 
     def poll_smeter(self):
         self._send_civ(bytes([0x15, 0x02]))
+
+    def poll_power(self):
+        # Read the rig's RF-power SETTING (14 0A). Read-only: we report it to AE
+        # so its power display is honest; AE never writes power back to the rig.
+        self._send_civ(bytes([0x14, 0x0A]))
 
     # --- PTT (CI-V 1C 00) — the raw key primitives. The SAFETY layer lives on
     # the adapter (Icom9700Adapter.key_tx/unkey_tx): arm-gate, band-check,
@@ -797,7 +809,8 @@ class Icom9700Adapter(RadioAdapter):
                 # sooner (see _on_iamready + the deaf-scope notes). Fewer freezes,
                 # zero functional loss.
                 READS = (bytes([0x25, 0x00]),   # selected freq (authority)
-                         bytes([0x26, 0x00]))   # selected mode
+                         bytes([0x26, 0x00]),   # selected mode
+                         bytes([0x14, 0x0A]))   # RF power SETTING (read-only display)
                 i = getattr(self, "_read_rr", 0)
                 self._civ._send_civ(READS[i % len(READS)])
                 self._read_rr = i + 1
@@ -883,6 +896,21 @@ class Icom9700Adapter(RadioAdapter):
         if self._usb:
             return self._echo_mode(self._usb.main_mode)
         return self._echo_mode(self._civ.mode) if self._civ else None
+
+    def radio_power_w(self):
+        """The rig's ACTUAL RF-power setting in watts (read-only, from 14 0A).
+        The 9700 does 0..100 W on 2m/70cm (0..10 W on 23cm); CI-V 14 0A reports
+        0..255 = 0..100% of that. Report % scaled to the band's max so AE's power
+        display matches the rig instead of the old hardcoded 100 W. None until a
+        reading lands (engine then keeps its previous value)."""
+        raw = self._civ.rfpower_raw if self._civ else None
+        if raw is None:
+            return None
+        pct = max(0.0, min(1.0, raw / 255.0))
+        f = self._civ.freq_hz if self._civ else None
+        mhz = (f / 1e6) if f else 145.0
+        band_max_w = 10.0 if 1200.0 <= mhz <= 1400.0 else 100.0    # 23cm=10 W
+        return round(pct * band_max_w, 1)
 
     def receivers(self):
         """The active receivers as {freq_hz, mode}: MAIN first (slice 0), RX2

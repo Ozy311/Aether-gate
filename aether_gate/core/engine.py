@@ -1626,6 +1626,17 @@ class Radio:
         if not self.conn:
             return
         on = self.tx_on
+        # HONEST POWER: report the rig's ACTUAL RF-power setting so AE stops
+        # showing the hardcoded 100 W. Read-only — AE's rfpower/tunepower sets are
+        # ignored (not parsed in the transmit-set handler), so power stays
+        # controlled at the rig's front panel. Keep the last value if no read yet.
+        if self.adapter is not None and hasattr(self.adapter, "radio_power_w"):
+            try:
+                pw = self.adapter.radio_power_w()
+                if pw is not None:
+                    self.tx_power_w = pw
+            except Exception:
+                pass
         try:
             self.status(self.conn,
                 f"interlock state={'TRANSMITTING' if on else 'READY'} source=SW "
