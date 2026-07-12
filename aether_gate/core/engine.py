@@ -833,7 +833,12 @@ class Radio:
         # then waits for the echo; without it AE logs micSelection="Unknown"
         # dax=unknown / "radio status not received" and won't route dax_tx audio to
         # us (proven on the linux box). Track + echo them.
-        self.tx_mic_selection = "MIC"   # MIC | PC | ACC (AE sets PC for DAX/digital)
+        # Report PC as the mic source: a GATE has no physical mic — its TX audio
+        # always comes from the network (DAX/dax_tx). AE only routes the modem's
+        # AFSK to the radio VITA send path (sendToRadio) when the mic source is
+        # PC; with MIC it keeps the audio local and nothing leaves AE (proven on
+        # the linux box: AE logged "Sending AX.25 AFSK" but zero UDP left it).
+        self.tx_mic_selection = "PC"    # MIC | PC | ACC — PC = network/DAX audio
         self.tx_dax = False             # radio-side DAX TX flag AE toggles
         self.tx_power_w = 100.0      # live: measured forward power (W) -> FWDPWR meter
         self.tx_power_level = 100     # live: RF-power SETTING 0..100 (% of max) -> rfpower field
@@ -924,26 +929,45 @@ class Radio:
             time.sleep(1.0)
 
     def prime_loop(self):
+        import select as _select
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((self.ip, self.port))
+        socks = [s]
+        # ALSO listen on 4991 — AE sends OUTBOUND VITA (dax_tx TX audio) to the
+        # radio on port 4991, NOT the control/data port (PanadapterStream
+        # m_radioPort=4991; confirmed on the wire: "TX stream started -> :4991").
+        # Without this the AFSK/TX audio hits a closed port and vanishes.
+        tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            tx.bind((self.ip, 4991))
+            socks.append(tx)
+            log("[udp] TX-audio listener bound on :4991 (AE dax_tx destination)")
+        except OSError as e:
+            log(f"[udp] could not bind :4991 for TX audio: {e}")
         while self.run:
             try:
-                data, addr = s.recvfrom(2048)
+                ready, _, _ = _select.select(socks, [], [], 0.5)
             except OSError:
                 break
-            if self.ae_peer_ip and addr[0] == self.ae_peer_ip and not self.vita_dest:
-                self.vita_dest = addr
-                log(f"[udp] captured VITA dest from prime: {addr} ({len(data)}B)")
-            # dax_tx: AE's TX audio for digital modes (AX.25). A VITA-49 packet
-            # whose stream id (word 1) is our dax_tx id, float32-stereo BE payload
-            # after the 7-word header (mirrors our RX audio_packet, reversed).
-            if (self.dax_tx_stream_id is not None and len(data) >= 32
-                    and self.ae_peer_ip and addr[0] == self.ae_peer_ip):
+            for rs in ready:
                 try:
-                    self._decode_dax_tx(data)
-                except Exception:
-                    pass   # a malformed TX packet must never kill the prime loop
+                    data, addr = rs.recvfrom(2048)
+                except OSError:
+                    continue
+                if self.ae_peer_ip and addr[0] == self.ae_peer_ip and not self.vita_dest:
+                    self.vita_dest = addr
+                    log(f"[udp] captured VITA dest from prime: {addr} ({len(data)}B)")
+                # dax_tx: AE's TX audio for digital modes (AX.25). A VITA-49 packet
+                # whose stream id (word 1) is our dax_tx id, float32-stereo BE payload
+                # after the 7-word header (mirrors our RX audio_packet, reversed).
+                if (self.dax_tx_stream_id is not None and len(data) >= 32
+                        and self.ae_peer_ip and addr[0] == self.ae_peer_ip):
+                    try:
+                        self._decode_dax_tx(data)
+                    except Exception:
+                        pass   # a malformed TX packet must never kill the prime loop
 
     def _decode_dax_tx(self, data):
         """Decode one AE dax_tx VITA packet -> mono int16 PCM into tx_pcm_ring.
