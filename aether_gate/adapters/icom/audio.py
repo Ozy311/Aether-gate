@@ -107,11 +107,27 @@ class Ic9700Audio(UdpBase):
         self.tx_frames = 0
         self.tx_bytes = 0
 
+    def start(self):
+        """Bring up the audio session with the RS-BA1 handshake so the radio
+        assigns us a remote_id — REQUIRED FOR SENDING (TX audio). RX-only worked
+        without it (the radio streams to the advertised port regardless), but
+        send_audio stamps rcvdid=remote_id into every packet; with remote_id=0
+        the radio rejects our TX audio (no modulation). Mirrors SDR9700
+        UdpAudio's areYouThereTimer(sendControl 0x03) + UdpCivData.start()."""
+        self.init()                            # UdpBase::init: mono clock + retransmit
+        self.send_control(False, 0x03, 0x00)   # are-you-there -> radio replies 0x06 -> remote_id
+        self._areyouthere_on = True
+        self._ping_on = True
+        self._idle_on = True
+        self._last_areyouthere = 0.0
+        self._last_ping = 0.0
+        self._last_idle = 0.0
+        super().start()
+
     def _on_iamready(self):
         # The audio session needs NO scope/openclose bring-up — being synced is
         # enough; the radio starts streaming audio to this port once ready.
-        # (UdpBase already sent 0x06 and keeps the are-you-there/ping/idle
-        # cadence via the timer thread.) Nothing to send here.
+        # (The 0x06 that got us here already set remote_id in _dispatch_subclass.)
         self._connected = True
 
     def _dispatch_subclass(self, r):
@@ -239,7 +255,14 @@ class Ic9700Audio(UdpBase):
             struct.pack_into("<H", b, 0x10, 0x0080)                     # ident (TX audio)
             struct.pack_into(">H", b, 0x12, self._send_audio_seq & 0xFFFF)  # sendseq (BE)
             struct.pack_into(">H", b, 0x16, len(partial))              # datalen (BE)
-            self.send_tracked(bytes(b) + bytes(partial))
+            ret = self.send_tracked(bytes(b) + bytes(partial))
             self._send_audio_seq = (self._send_audio_seq + 1) & 0xFFFF
             self.tx_frames += 1
             self.tx_bytes += len(partial)
+            # DIAG: log the first few real audio sends (peak of this chunk)
+            if self.tx_frames <= 8 or self.tx_frames % 200 == 0:
+                pk = max((abs(struct.unpack_from("<h", partial, i)[0])
+                          for i in range(0, len(partial) - 1, 2)), default=0)
+                print(f"[txaudio-send] frame={self.tx_frames} rid=0x{self.remote_id:08x} "
+                      f"seq={self._send_audio_seq} bytes={len(partial)} peak={pk} "
+                      f"send_tracked_ret={ret}", flush=True)

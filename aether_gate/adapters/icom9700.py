@@ -801,21 +801,49 @@ class Icom9700Adapter(RadioAdapter):
         tick_s = 0.02
         radio_bytes_per_tick = int(RADIO_RATE * tick_s) * 2
         ae_bytes_per_tick = radio_bytes_per_tick // 2    # 24k -> 48k is 2x
+        f0 = au.tx_frames
+        real = 0
+        seen_real = False
+        print(f"[tx-audio] drain START (tx_frames={f0})", flush=True)
         try:
             au.send_audio(self._silence(RADIO_RATE // 100))   # ~10 ms lead-in silence
-            while not stop.is_set():
+            # LATENCY GRACE: AE keys, THEN sends the AFSK over dax_tx (:4991) with
+            # network+decode latency, then unkeys ~150 ms after queuing. Our drain
+            # starts on xmit 1 — BEFORE the audio lands — so it used to blast
+            # silence and stop on xmit 0 before the audio ever arrived (0 real
+            # audio -> unmodulated carrier). Fix: keep draining until we've seen
+            # real audio AND the ring has run dry, with a bounded post-key flush,
+            # so late-arriving AFSK is still sent while keyed.
+            FLUSH_GRACE_S = 0.6            # keep sending after stop until ring dry (bounded)
+            flush_deadline = None
+            while True:
+                stopped = stop.is_set()
                 try:
                     pcm24 = src(ae_bytes_per_tick)
                 except Exception:
                     pcm24 = b""
                 if pcm24:
                     au.send_audio(self._upsample_2x(pcm24))
+                    real += 1
+                    seen_real = True
+                    flush_deadline = None      # got audio -> reset the flush timer
+                elif stopped:
+                    # unkey requested + ring empty: start/continue the flush grace,
+                    # then exit once it elapses (gives late AFSK a chance to arrive)
+                    if flush_deadline is None:
+                        flush_deadline = time.monotonic() + FLUSH_GRACE_S
+                    elif time.monotonic() >= flush_deadline:
+                        break
+                    au.send_audio(self._silence(radio_bytes_per_tick // 2))
                 else:
-                    # Ring empty but still keyed (modem gap): send silence so the
-                    # radio's TX audio buffer never underruns mid-transmission.
+                    # still keyed, ring momentarily empty (modem gap): fill silence
+                    # so the radio's TX audio buffer never underruns mid-burst.
                     au.send_audio(self._silence(radio_bytes_per_tick // 2))
                 time.sleep(tick_s)
             au.send_audio(self._silence(RADIO_RATE // 100))   # ~10 ms fade-out silence
+            print(f"[tx-audio] drain END sent={au.tx_frames-f0} frames "
+                  f"({real} real audio, seen_real={seen_real}, {au.tx_bytes} tx_bytes total)",
+                  flush=True)
         except Exception as e:
             print(f"[tx-audio] drain error: {e}", flush=True)
 
