@@ -49,6 +49,11 @@ _AREYOUTHERE_LIMIT = 20            # sendAreYouThere gives up at counter==20
 _FIXED_CIV_LOCAL_PORT = 40410
 _FIXED_AUDIO_LOCAL_PORT = 40411
 
+# TX-audio jitter buffer the radio should hold (ms) — SDR9700 passes txSetup.latency
+# here. A small buffer smooths our send cadence without adding audible delay to
+# half-duplex data TX.
+TX_LATENCY_MS = 100
+
 
 class Ic9700Handler(UdpBase):
     def __init__(self, local_ip, radio_ip, radio_port, username, password,
@@ -374,14 +379,20 @@ class Ic9700Handler(UdpBase):
         # requested-streams union @0x60.
         b[0x60:0x70] = obfuscate(self.username)               # username (encoded)
         b[0x70] = 0x01                                          # rxenable
-        b[0x71] = 0x00                                          # txenable (RX only)
+        # txenable: request a TX-audio stream so the gate can modulate the rig for
+        # digital modes (AX.25/RADE). SDR9700 only enables TX when the radio
+        # advertised txSampleRates>1 in capabilities; the 9700 always does, and
+        # this gate is TX-capable, so enable LPCM16 @ 48 kHz unconditionally.
+        # RX-audio behaviour is unchanged; a radio that ignores TX just never
+        # streams us anything to send (Stage 2 drains an empty ring = silence).
+        b[0x71] = 0x01                                          # txenable
         b[0x72] = 0x04                                          # rxcodec (LPCM16)
-        b[0x73] = 0x00                                          # txcodec
+        b[0x73] = 0x04                                          # txcodec (LPCM16)
         struct.pack_into(">I", b, 0x74, 48000)                 # rxsample (BE)
-        struct.pack_into(">I", b, 0x78, 0)                     # txsample (BE)
+        struct.pack_into(">I", b, 0x78, 48000)                 # txsample (BE)
         struct.pack_into(">I", b, 0x7c, self.civ_local_port)   # civport (BE)
         struct.pack_into(">I", b, 0x80, self.audio_local_port) # audioport (BE)
-        struct.pack_into(">I", b, 0x84, 0)                     # txbuffer (BE)
+        struct.pack_into(">I", b, 0x84, TX_LATENCY_MS)         # txbuffer/latency (BE)
         b[0x88] = 0x01                                          # convert
         self.send_tracked(bytes(b))
 

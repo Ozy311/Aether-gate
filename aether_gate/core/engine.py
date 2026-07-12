@@ -737,6 +737,16 @@ class Radio:
         # REPLACES the built-in pattern engine — the core stays identical, only the
         # per-frame spectrum source changes. None => legacy flex-sim pattern behaviour.
         self.adapter = adapter
+        # Give a TX-audio-capable adapter a pull-seam into our dax_tx ring so its
+        # TX-audio session can drain AE's modem audio to the rig while keyed. The
+        # RX direction is the mirror (engine pulls adapter.get_audio); TX is
+        # reversed (adapter pulls engine.drain_tx_audio), so we hand it the bound
+        # method rather than poll the adapter.
+        if adapter is not None and hasattr(adapter, "set_tx_audio_source"):
+            try:
+                adapter.set_tx_audio_source(self.drain_tx_audio)
+            except Exception as e:
+                log("[dax-tx] set_tx_audio_source failed:", e)
         if adapter is not None and getattr(adapter, "capabilities", None) is not None:
             model = adapter.capabilities.model or model   # adapter identity drives discovery/caps
         self.model = model if model in MODELS else MODEL
@@ -818,6 +828,13 @@ class Radio:
         self.conn = None            # active TCP conn (so the control panel can push TX status)
         self.tx_mox = False         # live: TX keyed (panel toggle or AE's 'transmit set mox=1')
         self.tx_tune = False
+        # AE's DAX-TX route decision needs the radio to CONFIRM mic_selection + dax
+        # in a transmit status. AE's DAX bridge sends 'transmit set mic_selection=PC'
+        # then waits for the echo; without it AE logs micSelection="Unknown"
+        # dax=unknown / "radio status not received" and won't route dax_tx audio to
+        # us (proven on the linux box). Track + echo them.
+        self.tx_mic_selection = "MIC"   # MIC | PC | ACC (AE sets PC for DAX/digital)
+        self.tx_dax = False             # radio-side DAX TX flag AE toggles
         self.tx_power_w = 100.0      # live: measured forward power (W) -> FWDPWR meter
         self.tx_power_level = 100     # live: RF-power SETTING 0..100 (% of max) -> rfpower field
         self.tx_swr = 1.2           # live: SWR reported while TX
@@ -954,6 +971,28 @@ class Radio:
             cap = 24000 * 2 // 2
             if len(self.tx_pcm_ring) > cap:
                 del self.tx_pcm_ring[:len(self.tx_pcm_ring) - cap]
+        # TEMP diagnostic: prove AE's dax_tx audio reaches the gate (linux test).
+        if self.tx_audio_frames % 50 == 1:
+            pk = max((abs(v) for v in mono), default=0.0)
+            log(f"[dax-tx] rx frames={self.tx_audio_frames} ring={len(self.tx_pcm_ring)}B peak={pk:.3f}")
+
+    def drain_tx_audio(self, max_bytes=None):
+        """Pop up to max_bytes of buffered AE TX audio (mono int16 LE at AE's
+        dax_tx rate, AUDIO_RATE = 24 kHz) from tx_pcm_ring; return b'' when empty. The
+        adapter's TX-audio session calls this while keyed, upsamples to the radio
+        rate, and streams it to the rig. Popping (not peeking) means a slow
+        drainer self-limits latency: the ring cap already drops the oldest."""
+        with self.tx_ring_lock:
+            if not self.tx_pcm_ring:
+                return b""
+            if max_bytes is None or max_bytes >= len(self.tx_pcm_ring):
+                out = bytes(self.tx_pcm_ring)
+                self.tx_pcm_ring.clear()
+            else:
+                max_bytes &= ~1                       # whole int16 samples
+                out = bytes(self.tx_pcm_ring[:max_bytes])
+                del self.tx_pcm_ring[:max_bytes]
+            return out
 
     def serve(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1247,6 +1286,13 @@ class Radio:
             kvs = parse_kvs(c)
             if "mox" in kvs:  self.tx_mox = kvs["mox"] == "1"
             if "tune" in kvs: self.tx_tune = kvs["tune"] == "1"
+            # Track + ECHO mic_selection / dax so AE's DAX-TX route decision
+            # completes (it waits for the radio to confirm these before routing
+            # dax_tx audio to us — see tx_mic_selection init note).
+            if "mic_selection" in kvs:
+                self.tx_mic_selection = kvs["mic_selection"].upper()
+            if "dax" in kvs:
+                self.tx_dax = kvs["dax"] == "1"
             # WIRE AE's MOX -> real guarded PTT. Before this, tx_mox was only
             # tracked + echoed to AE (AE showed TX but the rig never keyed — only
             # the hand mic could TX). Now MOX keys the actual radio through the
@@ -1716,8 +1762,12 @@ class Radio:
                 f"tx_client_handle=0x{self.handle_hex}")
             self.status(self.conn,
                 f"transmit mox={1 if self.tx_mox else 0} tune={1 if self.tx_tune else 0} "
-                f"freq={self.slice_freq:.6f} rfpower={level} tunepower={level}")
-            log(f"[->] TX {'ON' if on else 'off'}  (level {level}%, SWR {self.tx_swr:.1f})")
+                f"freq={self.slice_freq:.6f} rfpower={level} tunepower={level} "
+                # CONFIRM mic_selection + dax so AE's DAX-TX route decision can
+                # complete and it routes dax_tx audio to us (linux AX.25 test).
+                f"mic_selection={self.tx_mic_selection} dax={1 if self.tx_dax else 0}")
+            log(f"[->] TX {'ON' if on else 'off'}  (level {level}%, mic={self.tx_mic_selection} "
+                f"dax={1 if self.tx_dax else 0}, SWR {self.tx_swr:.1f})")
         except OSError:
             pass
 

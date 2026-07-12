@@ -392,8 +392,10 @@ class Icom9700Adapter(RadioAdapter):
         # tx_capable=True now that real guarded PTT is wired (key_tx: armed +
         # 2m/70cm only, 23cm refused, 10 s watchdog). This makes the engine
         # advertise tx=1 on the active slice so AE un-greys the TX button; MOX
-        # then routes to key_tx(). TX is still PTT-only (no TX audio path yet) —
-        # keying gives a bare carrier until the TX-audio session is built.
+        # then routes to key_tx(). TX audio (Stage 2) is wired too: while keyed,
+        # a drain thread streams AE's dax_tx modem audio to the rig's RS-BA1 TX
+        # audio session (txenable=1), so the carrier is MODULATED (AX.25/RADE),
+        # not bare — see _tx_audio_loop + Ic9700Audio.send_audio.
         self.capabilities = AdapterCaps(model=model, serial=serial, station=station,
                                         tx_capable=True,
                                         min_span_hz=5_000.0, max_span_hz=1_000_000.0,
@@ -416,6 +418,11 @@ class Icom9700Adapter(RadioAdapter):
         self._tx_keyed = False            # are we currently keyed?
         self._tx_watchdog = None          # threading.Timer that force-unkeys
         self._tx_lock = threading.Lock()
+        # --- TX AUDIO (Stage 2): drain AE's dax_tx ring -> 9700 while keyed. ---
+        self._tx_audio_source = None      # engine.drain_tx_audio (set via set_tx_audio_source)
+        self._tx_audio_thread = None      # per-key drain thread
+        self._tx_audio_stop = None        # threading.Event to stop the drain thread
+        self._tx_resample_carry = b""     # 24k->48k upsampler state (last sample)
         self._span_half_hz = 500_000      # what the scope is set to (± half-width)
         self._span_sent_at = 0.0
         self._smeter_sent_at = 0.0        # rate-limit the 15 02 poll (10 Hz like SDR9700)
@@ -719,6 +726,9 @@ class Icom9700Adapter(RadioAdapter):
             self._tx_watchdog = threading.Timer(self.TX_MAX_KEY_S, self._tx_timeout)
             self._tx_watchdog.daemon = True
             self._tx_watchdog.start()
+            # Start draining AE's TX audio to the rig so the carrier is MODULATED
+            # (AX.25/RADE), not bare. No-op if no TX-audio source/session is wired.
+            self._start_tx_audio()
             print(f"[tx] KEYED @ {mhz:.5f} MHz (watchdog {self.TX_MAX_KEY_S:.0f}s)",
                   flush=True)
             return True
@@ -726,6 +736,8 @@ class Icom9700Adapter(RadioAdapter):
     def unkey_tx(self):
         """Unkey the transmitter (CI-V 1C 00 00). Always safe; cancels watchdog."""
         with self._tx_lock:
+            # Stop the TX-audio drain FIRST so no more audio is sent after unkey.
+            self._stop_tx_audio()
             if self._tx_watchdog is not None:
                 self._tx_watchdog.cancel()
                 self._tx_watchdog = None
@@ -743,6 +755,94 @@ class Icom9700Adapter(RadioAdapter):
     def _tx_timeout(self):
         print(f"[tx] WATCHDOG fired ({self.TX_MAX_KEY_S:.0f}s) -> forcing RX", flush=True)
         self.unkey_tx()
+
+    # --- TX AUDIO (Stage 2): drain AE's dax_tx ring -> 9700 while keyed --------
+    def set_tx_audio_source(self, source):
+        """Engine seam: `source()` (or source(max_bytes)) returns buffered AE TX
+        audio as mono int16 LE @ 24 kHz (the dax_tx rate). Called once at wiring."""
+        self._tx_audio_source = source
+
+    def _start_tx_audio(self):
+        """Spawn the drain thread that streams AE's modem audio to the rig for as
+        long as we're keyed. No-op if there's no source or no audio session."""
+        if getattr(self, "_tx_audio_source", None) is None or self._audio is None:
+            return
+        if self._tx_audio_thread is not None and self._tx_audio_thread.is_alive():
+            return
+        self._tx_resample_carry = b""
+        self._audio._send_audio_seq = 0            # fresh audio-seq window per key
+        self._tx_audio_stop = threading.Event()
+        self._tx_audio_thread = threading.Thread(
+            target=self._tx_audio_loop, args=(self._tx_audio_stop,),
+            name="ic9700-tx-audio", daemon=True)
+        self._tx_audio_thread.start()
+
+    def _stop_tx_audio(self):
+        """Signal the drain thread to finish; it sends a short fade-out of silence
+        so the AFSK tail doesn't click when the rig unkeys."""
+        ev = getattr(self, "_tx_audio_stop", None)
+        if ev is not None:
+            ev.set()
+        # Don't join under _tx_lock (unkey_tx holds it) — the daemon thread exits
+        # on the event; a lingering send is harmless (radio is about to unkey).
+        self._tx_audio_thread = None
+        self._tx_audio_stop = None
+
+    def _tx_audio_loop(self, stop):
+        """Pull 24 kHz mono int16 from AE's ring, upsample 2x -> 48 kHz, and send
+        to the radio in ~20 ms chunks. A short silence fade opens and closes the
+        burst so the modem's AFSK doesn't start/stop with a click. Runs only while
+        keyed; exits when stop is set (unkey/close/watchdog)."""
+        au = self._audio
+        src = self._tx_audio_source
+        if au is None or src is None:
+            return
+        # ~20 ms at 48 kHz mono = 960 samples = 1920 bytes per send tick.
+        tick_s = 0.02
+        radio_bytes_per_tick = int(RADIO_RATE * tick_s) * 2
+        ae_bytes_per_tick = radio_bytes_per_tick // 2    # 24k -> 48k is 2x
+        try:
+            au.send_audio(self._silence(RADIO_RATE // 100))   # ~10 ms lead-in silence
+            while not stop.is_set():
+                try:
+                    pcm24 = src(ae_bytes_per_tick)
+                except Exception:
+                    pcm24 = b""
+                if pcm24:
+                    au.send_audio(self._upsample_2x(pcm24))
+                else:
+                    # Ring empty but still keyed (modem gap): send silence so the
+                    # radio's TX audio buffer never underruns mid-transmission.
+                    au.send_audio(self._silence(radio_bytes_per_tick // 2))
+                time.sleep(tick_s)
+            au.send_audio(self._silence(RADIO_RATE // 100))   # ~10 ms fade-out silence
+        except Exception as e:
+            print(f"[tx-audio] drain error: {e}", flush=True)
+
+    @staticmethod
+    def _silence(n_samples):
+        return b"\x00\x00" * int(n_samples)
+
+    def _upsample_2x(self, pcm24):
+        """Linear-interpolate 24 kHz mono int16 LE -> 48 kHz. Carries the last
+        sample across calls so chunk boundaries interpolate correctly (no seam
+        click). Good enough for AFSK/data; not a brick-wall resampler."""
+        import struct as _struct
+        prev = self._tx_resample_carry
+        buf = prev + pcm24
+        n = len(buf) // 2
+        if n < 2:
+            self._tx_resample_carry = buf
+            return b""
+        s = _struct.unpack(f"<{n}h", buf[:n * 2])
+        out = []
+        for i in range(n - 1):
+            a, b = s[i], s[i + 1]
+            out.append(a)
+            out.append((a + b) // 2)
+        # keep the last input sample as carry for the next chunk
+        self._tx_resample_carry = _struct.pack("<h", s[-1])
+        return _struct.pack(f"<{len(out)}h", *out)
 
     def set_span(self, span_hz):
         """Follow AE's pan zoom: full width -> nearest Icom ± half-width setting."""
@@ -1110,7 +1210,11 @@ class Icom9700Adapter(RadioAdapter):
                       "packets": (self._audio.audio_frames if self._audio else 0),
                       "bytes": (self._audio.audio_bytes if self._audio else 0),
                       "ring_samples": (self._audio.ring_samples if self._audio else 0),
-                      "dropped": (self._audio.dropped if self._audio else 0)},
+                      "dropped": (self._audio.dropped if self._audio else 0),
+                      "tx_frames": (self._audio.tx_frames if self._audio else 0),
+                      "tx_bytes": (self._audio.tx_bytes if self._audio else 0),
+                      "tx_draining": (self._tx_audio_thread is not None
+                                      and self._tx_audio_thread.is_alive())},
             "flags": {"sub_receiver": (self.sub_active() if civ else False),
                       "dualwatch_reg": bool(civ.dualwatch) if civ else False},
             "counters": {"tune_ok": (civ.n_fb if civ else 0),

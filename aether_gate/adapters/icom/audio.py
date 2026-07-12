@@ -26,6 +26,7 @@ from .udpbase import UdpBase, CONTROL_SIZE, AUDIO_SIZE
 
 AUDIO_HDR = 0x18                 # audio packet header size
 RADIO_RATE = 48000              # the rxsample we request in conninfo (handler.py)
+_TX_FRAG = 1364                  # max PCM bytes per TX audio datagram (SDR9700 sendAudioBuffer)
 # Cap the decoded ring to a SMALL realtime window. Audio is live QSO audio, so
 # low latency beats completeness: if the reader (AE) falls behind, drop the
 # OLDEST samples to stay current rather than build a growing delay. ~0.3 s of
@@ -98,6 +99,13 @@ class Ic9700Audio(UdpBase):
         self.audio_frames = 0          # count of audio datagrams parsed (diagnostics)
         self.audio_bytes = 0           # total PCM bytes received
         self.dropped = 0               # samples dropped when the ring overflowed
+        # TX-audio state (Stage 2 — gate -> radio). sendAudioSeq is a SEPARATE
+        # 16-bit counter for the audio-layer sendseq field, distinct from the
+        # transport seq that send_tracked() stamps into [6:8] (mirrors SDR9700
+        # UdpAudio::sendAudioSeq). Diagnostics: frames/bytes we pushed to the rig.
+        self._send_audio_seq = 0
+        self.tx_frames = 0
+        self.tx_bytes = 0
 
     def _on_iamready(self):
         # The audio session needs NO scope/openclose bring-up — being synced is
@@ -202,3 +210,36 @@ class Ic9700Audio(UdpBase):
     def ring_samples(self):
         with self._ring_lock:
             return len(self._ring) // 2
+
+    # ==================================================================== #
+    #  TX audio (gate -> radio) — Stage 2                                    #
+    #  Ported from SDR9700 UdpAudio::sendAudioBuffer (GPL-3.0).              #
+    # ==================================================================== #
+    def send_audio(self, pcm):
+        """Send int16 LE PCM (at the radio's TX rate, mono) to the 9700 as one
+        or more RS-BA1 TX-audio datagrams. Port of SDR9700 UdpAudio::sendAudioBuffer:
+        fragment into <=1364-byte chunks; each chunk is a 0x18 audio_packet header
+        (ident=0x0080 = the TX-audio marker the 9700 expects for normal fragments;
+        0x0081 causes decode artifacts at transmit start per the reference), our own
+        big-endian sendseq + datalen, then the PCM. send_tracked() stamps the outer
+        transport seq and buffers for retransmit, exactly like sendTrackedPacket()."""
+        if not pcm:
+            return
+        mv = memoryview(pcm)
+        off = 0
+        n = len(mv)
+        while off < n:
+            partial = mv[off:off + _TX_FRAG]
+            off += len(partial)
+            b = bytearray(AUDIO_HDR)
+            struct.pack_into("<I", b, 0x00, AUDIO_HDR + len(partial))   # len (LE)
+            # [4:6] type + [6:8] transport seq are stamped by send_tracked.
+            struct.pack_into("<I", b, 0x08, self.my_id)                 # sentid
+            struct.pack_into("<I", b, 0x0c, self.remote_id)             # rcvdid
+            struct.pack_into("<H", b, 0x10, 0x0080)                     # ident (TX audio)
+            struct.pack_into(">H", b, 0x12, self._send_audio_seq & 0xFFFF)  # sendseq (BE)
+            struct.pack_into(">H", b, 0x16, len(partial))              # datalen (BE)
+            self.send_tracked(bytes(b) + bytes(partial))
+            self._send_audio_seq = (self._send_audio_seq + 1) & 0xFFFF
+            self.tx_frames += 1
+            self.tx_bytes += len(partial)
