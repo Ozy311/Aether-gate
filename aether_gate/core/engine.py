@@ -1488,7 +1488,16 @@ class Radio:
         return pid
 
     def _primary_pan(self):
-        return next(iter(self.pans)) if self.pans else self._new_pan()
+        # READ-ONLY accessor: the current primary pan, or None if none exist yet.
+        # It must NOT create a pan — doing so meant a `display pan set default ...`
+        # that AE sends BEFORE `display panafall create` conjured a phantom pan
+        # (0x40000000), so AE's real create landed on a 2nd pan (0x40000001) and
+        # the client saw two panadapters — which it then reconciled down to one,
+        # destabilising the FIRST connect (blank radio-name box + 2->1 slice) and
+        # forcing a reconnect. Panadapters are created ONLY by the explicit
+        # `display pan[afall] create` handler. Callers that need a pan id already
+        # tolerate None (self.pans.get(None) -> None, then guarded).
+        return next(iter(self.pans)) if self.pans else None
 
     def _pan_center(self, pid):                            # a pan's own framing centre (NOT the slice freq:
         pan = self.pans.get(pid)                           # a slice can tune within a fixed pan, autopan=0)
@@ -1545,6 +1554,8 @@ class Radio:
     def _handle_pan_zoom(self, pid, kvs):
         if pid is None:
             pid = self._primary_pan()
+        if pid is None:
+            return False                                   # no pan yet -> nothing to zoom
         mode = None
         state = None
         if "band_zoom" in kvs:
@@ -1622,6 +1633,7 @@ class Radio:
         sl = self.slices.get(idx)
         if not sl: return
         pid = sl.get("pan") or self._primary_pan()
+        if pid is None: return                             # no pan yet -> nothing to anchor the slice status to
         # index_letter labels the flag AE draws (A/B/...) so two slices on one
         # pan are distinguishable (scout: SliceModel reads index_letter).
         letter = chr(ord('A') + (idx if idx < 26 else 0))
@@ -2803,6 +2815,36 @@ def start_control_server(radio, port):
                                                  "sub": s.get("sub", False)}
                                         for i, s in radio.slices.items()}}
                 return self._json(d)
+            # ---- CI-V SET-menu settings read (diagnostics + config) ----
+            # /settings          -> read every known menu item
+            # /settings?name=X   -> read one item
+            # /settings/set?name=X&value=N -> write one item (radios that support it)
+            if u.path == "/settings":
+                a = radio.adapter
+                if a is None or not hasattr(a, "read_all_settings"):
+                    return self._json({"error": "adapter has no CI-V settings facility"})
+                q = urllib.parse.parse_qs(u.query)
+                if "name" in q and hasattr(a, "read_setting"):
+                    name = q["name"][0]
+                    return self._json({name: a.read_setting(name)})
+                return self._json(a.read_all_settings())
+            if u.path == "/settings/set":
+                a = radio.adapter
+                if a is None or not hasattr(a, "write_setting"):
+                    return self._json({"error": "adapter has no CI-V settings facility"})
+                q = urllib.parse.parse_qs(u.query)
+                name = q.get("name", [None])[0]
+                val = q.get("value", [None])[0]
+                if name is None or val is None:
+                    return self._json({"error": "name and value required"})
+                try:
+                    val = int(val)
+                except (TypeError, ValueError):
+                    return self._json({"error": "value must be an integer"})
+                ok = a.write_setting(name, val)
+                # read back so the caller sees the applied value
+                rb = a.read_setting(name) if hasattr(a, "read_setting") else None
+                return self._json({"name": name, "wrote": val, "ok": ok, "readback": rb})
             if u.path == "/radio":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
