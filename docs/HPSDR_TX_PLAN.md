@@ -146,11 +146,15 @@ Flagged honestly rather than assumed:
   *continuous at the sample rate* — 48 kHz needs ~63 packets/s, and any gap is a hole in the
   transmitted signal. The current `_cc_loop` 20 Hz sender is **not** a suitable TX pump. Whether
   Python can sustain it reliably on the Pi is **unmeasured** and is the main technical risk.
-- **Radioberry PA.** I do not know its output power, duty-cycle limits, or thermal behaviour, or
-  whether Nigel's board has a PA/filters fitted at all. **Establish this from the hardware before
-  any RF.** FT8 is 100% duty cycle for 13 s — unforgiving.
-- **Does the Radioberry TX at all in this setup?** Board id `0x06` says "HL2 on the wire" for RX;
-  it does not prove a working TX chain, filters, or T/R switching.
+- **Radioberry PA — PARTLY ANSWERED (Nigel, 2026-07-16).** His board has a **PA hat with a T/R
+  switch and an I2C-controlled low-pass filter bank** (upstream: https://github.com/pa3gsb/Radioberry-2.x).
+  So a TX chain, T/R switching and band filtering **do exist** — Phase 2/3 are not blocked on
+  "does it transmit at all". **Still unknown and must be established from the hardware/upstream
+  before any RF:** output power, duty-cycle limits, thermal behaviour, and — critically — **whether
+  the I2C LPF bank is selected by the gateware automatically from the TX NCO, or must the HOST
+  select the filter for the band.** If it is host-driven, transmitting without setting the filter
+  means **radiating unfiltered harmonics**, which is both illegal and a good way to kill the PA.
+  That question gates Phase 2. FT8 is 100% duty cycle for 13 s — unforgiving.
 - **`CONFIG_DUPLEX`** is already set on in `cc_config` (pihpsdr does it unconditionally). Its exact
   TX-side meaning here is unverified.
 - **Sideband convention on TX** — see Phase 3. Unknown until measured.
