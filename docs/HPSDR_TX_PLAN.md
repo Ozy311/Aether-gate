@@ -351,8 +351,46 @@ Flagged honestly rather than assumed:
   harmonic suppression empirically.** Source-reading says the filter should be selected for us;
   today's lesson says measure it rather than trust a code path we have not seen run.
 
-  Still unknown besides: output power, duty-cycle limits, thermal behaviour. FT8 is 100% duty for
-  13 s — unforgiving.
+- **✅ TELEMETRY + PA PROTECTION EXIST — CONFIRMED FROM SOURCE 2026-07-16 (Nigel asked; he was
+  right).** The preamp/PA board carries a **MAX11613 4-channel I2C ADC @ `0x34`** (`measure.h`),
+  read as:
+
+  ```c
+  void read_I2C_measure(int *current, int *temperature, int *fwd, int *rev);
+  ```
+
+  So there IS **PA temperature, PA current, and FORWARD + REVERSE power** (i.e. the makings of
+  VSWR). Better still, two things we do not have to build:
+
+  **1. The firmware protects the PA itself** (`radioberry.c`, `rb_measure_thread`):
+  ```c
+  // temperature == (((T*.01)+.5)/3.26)*4096   if pa temperature > 50C (=1256) switch pa off!
+  if (pa_temp_ok && (pa_temp >= 1256)) {
+      fprintf(stderr, "ALERT: temperature of PA is higher than 50C; PA will be switched off!\n");
+      pa_temp_ok = 0;
+  }
+  ```
+  …with auto-recovery once the temp is back in range for 10 s, and `pa_temp_ok` folded into the
+  gateware control word (`rb_command`). It also disables the PA if temp/current **cannot be
+  measured** at all — fail-safe, not fail-open. This substantially de-risks the FT8 100%-duty worry.
+
+  **2. The telemetry comes back to us in the EP6 stream we ALREADY receive** — no extra transport,
+  no I2C on our side. `radioberry.c` alternates it into the C&C bytes of each EP6 frame, keyed by
+  `hpsdrdata[11]`:
+  | `[11] & 0xF8` | `[12:13]` | `[14:15]` |
+  |---|---|---|
+  | `0x08` (even seq) | PA temp (or RPi temp if no module) | **FWD power** |
+  | `0x10` (odd seq) | **REV power** | PA current |
+
+  **Phase 3+ should decode this and surface it to AE** (fwd/rev → SWR meter, temp → a guard).
+  Our `parse_ep6`/`iq_samples` currently ignore the C&C bytes entirely — they only read the IQ
+  payload. This is a clean, RF-free win available *before* TX: **decode and display it during RX
+  first**, so the telemetry path is proven before it is load-bearing.
+
+  ⚠ Still genuinely unknown: **output power** and **duty-cycle limits** as numbers, and whether
+  Nigel's board actually has the preamp/measure module fitted (`i2c_measure_module_active` gates all
+  of the above — without it the firmware falls back to RPi CPU temp and there is no fwd/rev at all).
+  **Confirm `i2c_measure_module_active` is true on his board before relying on any of it.**
 - **`CONFIG_DUPLEX`** is already set on in `cc_config` (pihpsdr does it unconditionally). Its exact
   TX-side meaning here is unverified.
 - **Sideband convention on TX** — see Phase 3. Unknown until measured.
