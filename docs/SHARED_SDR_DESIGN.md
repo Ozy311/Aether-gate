@@ -85,12 +85,37 @@ and cheap). A makes multi-dongle work and is a prerequisite for D. C only if a g
 many-consumers-one-dongle need appears — and note it cannot make two rigs on different bands share one
 IF tap.
 
-⚠ **The physical question that outranks all of this:** an IF-tap dongle is *cabled to one rig's IF
-output*. Even with a broker, moving it between the TS-450S and the FT-847 is a coax move, not a
-software one. So the real question for Nigel: **is the dongle physically wired to one rig, or is
-there a splitter/switch?** If it is cabled to one rig, then "assign it to that rig" is not a design
-flaw — it is the truth, and the fix is only to make the OTHER gates degrade gracefully (B) rather
-than pretend they could have it. **Answer this before building anything.**
+## ✅ ANSWERED (Nigel, 2026-07-16): the RTL is on an ANTENNA, not an IF tap
+
+*"the rtl is NOT wired to the kenwood if output - its to an antenna."*
+
+**This makes Nigel's instinct correct and my IF-tap caveat wrong.** The dongle is not cabled to any
+rig — it is an **independent wideband receiver on its own antenna**. Consequences:
+
+- **There is no physical reason to tie it to a radio.** The whole "the dongle belongs to the rig
+  whose IF it taps" premise evaporates. It is a shared resource in the fullest sense, and the current
+  model (a private `SoapyAdapter` inside each CAT adapter) is simply wrong.
+- **The C-broker objection dissolves.** I argued a broker "cannot make two rigs on different bands
+  share one IF tap" — true for an IF tap, irrelevant here. On an antenna the dongle can be tuned
+  anywhere; the only contention is *which centre frequency*, which is arbitration, not physics.
+- **The adapter's own docstring already allows this:** "*a SoapySDR dongle ... tapped off-air / IF /
+  antenna and STEERED to follow the rig's tuned freq*." Only the module header says "IF-tap"; the
+  design was always broader. The naming is what misleads (incl. `diagnostics()` reporting
+  "TS-450S (hamlib CAT + IF-tap SDR)" — inaccurate on this setup).
+- **CAT-steer still makes sense** — the dongle follows the rig's frequency so AE's panadapter shows
+  where the rig is tuned. That is a *choice*, not a wiring constraint, and it is why the spectrum
+  looks rig-specific when the hardware is not.
+
+**Revised recommendation: B then A, and C is now genuinely on the table** (it was not, under the
+IF-tap assumption). A shared antenna-fed dongle *could* serve several gates — the open question is
+centre-frequency arbitration, since CAT-steer means each gate wants it parked on its own rig.
+An honest first step for that: let ONE gate own the steer and others consume the same IQ.
+
+⚠ **Corollary worth stating plainly:** the RTL's spectrum is *not the TS-450S's receiver*. It is a
+separate antenna's view of the band, steered to the rig's frequency. Signals on AE's panadapter come
+from the dongle's antenna, and the S-meter comes from hamlib (the rig). **They can legitimately
+disagree** — different antennas, different front ends. That is worth knowing before anyone debugs a
+"mismatch" that is not one.
 
 ## Immediate state (2026-07-16)
 - `yaesu-gate`: **stopped** (to free the dongle), still `enabled` -> returns on reboot.
