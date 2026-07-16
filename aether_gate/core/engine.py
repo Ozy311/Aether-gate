@@ -747,6 +747,16 @@ class Radio:
                 adapter.set_tx_audio_source(self.drain_tx_audio)
             except Exception as e:
                 log("[dax-tx] set_tx_audio_source failed:", e)
+        # Also hand it a probe for whether AE has actually REGISTERED a dax_tx
+        # stream. Without this the adapter cannot tell "ring momentarily empty"
+        # from "AE never created the stream, so no audio can ever arrive" — and
+        # the latter means keying produces a BARE CARRIER. Measured on Jul 15:
+        # 127 of 261 keys ran with no dax_tx stream registered. See tx_audio_ready.
+        if adapter is not None and hasattr(adapter, "set_tx_audio_ready_probe"):
+            try:
+                adapter.set_tx_audio_ready_probe(self.tx_audio_ready)
+            except Exception as e:
+                log("[dax-tx] set_tx_audio_ready_probe failed:", e)
         if adapter is not None and getattr(adapter, "capabilities", None) is not None:
             model = adapter.capabilities.model or model   # adapter identity drives discovery/caps
         self.model = model if model in MODELS else MODEL
@@ -999,6 +1009,21 @@ class Radio:
         if self.tx_audio_frames % 50 == 1:
             pk = max((abs(v) for v in mono), default=0.0)
             log(f"[dax-tx] rx frames={self.tx_audio_frames} ring={len(self.tx_pcm_ring)}B peak={pk:.3f}")
+
+    def tx_audio_ready(self):
+        """True if AE has registered a dax_tx stream, i.e. TX audio CAN arrive.
+
+        Not "audio is buffered right now" — the ring is legitimately empty between
+        modem bursts. This answers the different question: is there a live stream
+        id at all? Without one the prime loop's guard drops every inbound VITA
+        packet before _decode_dax_tx, so no audio can EVER arrive and keying gives
+        a bare carrier. AE does not always send `stream create type=dax_tx` before
+        it keys (measured 2026-07-15: 127 of 261 keys had no stream registered —
+        AE sent `transmit set dax=1` + `xmit 1` with no stream create); the trigger
+        for when AE does vs doesn't is not yet understood, so the adapter must
+        check rather than assume.
+        """
+        return self.dax_tx_stream_id is not None
 
     def drain_tx_audio(self, max_bytes=None):
         """Pop up to max_bytes of buffered AE TX audio (mono int16 LE at AE's
