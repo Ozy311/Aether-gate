@@ -73,6 +73,15 @@ class HpsdrAdapter(RadioAdapter):
         self._gain_dirty = False           # AE moved the RF-gain slider (rebuild gain reg)
         self._sender = None                # EP2 C&C thread (decoupled from EP6)
         self._resettle = False             # _cc_loop -> reader: retuned, drop partial IQ
+        # --- response telemetry (temp / fwd / rev / current), accumulated from
+        # the EP6 C&C bytes. Latest-wins; the two register slots alternate across
+        # frames so a single packet rarely carries both. `_telem_seen` tracks
+        # whether a sensor has EVER reported non-zero: a board without the sensor
+        # hardware streams zeros forever, and a zero must never be mistaken for a
+        # real reading (see hpsdr_proto.parse_ep6_telemetry).
+        self._telem = {}
+        self._telem_seen = {"fwd": False, "rev": False, "current": False}
+        self._telem_lock = threading.Lock()
         self._board_id = None
         # --- audio / SSB demod state (mirrors the soapy adapter) ---
         import collections
@@ -258,6 +267,16 @@ class HpsdrAdapter(RadioAdapter):
                 break
             if hp.ep6_seq(d) is None:
                 continue
+            # Response telemetry rides in the same packets' C&C bytes. Cheap (5 B
+            # per frame, no IQ decode) and independent of the settle window — it
+            # is radio status, not signal, so we want it even while settling.
+            t = hp.parse_ep6_telemetry(d)
+            if t is not None:
+                with self._telem_lock:
+                    self._telem.update(t)
+                    for k in ("fwd", "rev", "current"):
+                        if t.get(k):        # non-zero => the sensor is real
+                            self._telem_seen[k] = True
             if time.monotonic() - settle_from < SETTLE_S:
                 continue                    # NCO/AGC still settling — drop these
             for i, q in hp.iq_samples(d):
@@ -283,6 +302,52 @@ class HpsdrAdapter(RadioAdapter):
         rfgain = max(0.0, min(100.0, float(rfgain)))
         self.gain_db = int(round(-12 + rfgain / 100.0 * 60))   # 0->-12dB, 100->+48dB
         self._gain_dirty = True
+
+    def telemetry(self):
+        """Latest radio-reported telemetry, or {} before any EP6 has arrived.
+
+            {"temp_c": float, "temp_raw": int,
+             "fwd": int, "rev": int, "current": int,   # raw ADC counts
+             "swr": float|None,                        # None = unknown, NOT good
+             "has_sensors": bool,                      # see below
+             "pa_temp_ok": bool, "running": bool}
+
+        ⚠ `has_sensors` is the honest bit. A Radioberry without the preAmp board
+        has no MAX11613 ADC: its firmware streams fwd/rev/current as a permanent
+        0 and falls back to the RPi's CPU temperature, so every field LOOKS
+        plausible while meaning nothing. We report has_sensors=True only once a
+        power/current field has actually been non-zero. Until then, treat temp_c
+        as "some temperature, possibly the host CPU's" and swr as unknown.
+        A real HL2 reports all four natively and will set this True on TX.
+        """
+        with self._telem_lock:
+            t = dict(self._telem)
+            seen = dict(self._telem_seen)
+        if not t:
+            return {}
+        t["has_sensors"] = any(seen.values())
+        t["swr"] = hp.swr_from_fwd_rev(t.get("fwd", 0), t.get("rev", 0))
+        return t
+
+    def diagnostics(self):
+        """Adapter seam: what the gate sees from the radio (control panel /radio).
+
+        The HPSDR adapter previously had no diagnostics hook at all, so the panel
+        showed only model/slice and none of the radio's own reported state.
+        """
+        t = self.telemetry()
+        d = {"radio_ip": self.radio_ip,
+             "board_id": f"0x{(self._board_id or 0):02x}",
+             "samp_rate": self.samp_rate,
+             "center_hz": self.center_hz,
+             "gain_db": self.gain_db}
+        if t:
+            d["telemetry"] = t
+            if not t.get("has_sensors"):
+                d["telemetry_note"] = ("no fwd/rev/current sensors detected — this "
+                                       "board reports zeros and a host-CPU temp "
+                                       "fallback (no preAmp/MAX11613 fitted)")
+        return d
 
     def set_span(self, span_hz):
         """Follow AE's pan zoom onto the nearest HPSDR sample rate. Returns the

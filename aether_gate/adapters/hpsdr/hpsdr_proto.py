@@ -117,6 +117,109 @@ def parse_ep6(pkt: bytes):
     return seq, n, peak, sumsq, sync_ok
 
 
+# --- EP6 response telemetry (C&C bytes, the radio -> host direction) --------
+#
+# Every EP6 frame carries C0..C4 just like EP2 does, but INBOUND they are the
+# radio's response registers, not our commands. HL2 (and the Radioberry, which
+# mirrors the layout) alternate two register slots across successive frames:
+#
+#   C0 & 0xF8 == 0x08 :  C1:C2 = temperature      C3:C4 = forward power
+#   C0 & 0xF8 == 0x10 :  C1:C2 = reverse power    C3:C4 = PA current
+#
+# C0's low 3 bits are the Radioberry's rb_control status word:
+#   bit2 = pa_temp_ok   bit1 = CWX   bit0 = running
+# (HL2 uses the same C0 slot ids; its status bits are its own — treat the low
+# bits as informational, and key only off the 0x08/0x10 slot id.)
+#
+# Source: openHPSDR Protocol-1 / Hermes-Lite2 wiki "Protocol" (ACK==0 base memory
+# map: response reg 0x01 = [31:16] temp, [15:0] fwd; reg 0x02 = [31:16] rev,
+# [15:0] current), cross-checked against the Radioberry firmware's packing
+# (radioberry.c, hpsdrdata[11..15] + coarse_pointer). Clean-room: wire FACTS only.
+#
+# ⚠ ZEROS ARE MEANINGFUL. A Radioberry WITHOUT the preAmp board has no MAX11613
+# ADC, so its firmware never populates fwd/rev/current and they stay 0 forever,
+# while temperature falls back to the RPi's own CPU temp. Verified live on
+# Nigel's board 2026-07-16: both slots alternate correctly, temp ~1100 (=RPi
+# CPU), fwd/rev/current all 0, pa_temp_ok=0 on every packet. So `has_sensors`
+# below reports whether the numbers mean anything — do NOT drive a TX guard off
+# a reading without checking it.
+
+TELEM_SLOT_TEMP_FWD = 0x08     # C0 & 0xF8 -> C1:C2 temp,    C3:C4 fwd
+TELEM_SLOT_REV_CUR = 0x10      # C0 & 0xF8 -> C1:C2 rev,     C3:C4 current
+
+# Radioberry firmware's ADC encoding, from radioberry.c's own comment:
+#   temperature == (((T*.01)+.5)/3.26)*4096   -> PA off above 50 C (raw 1256)
+_TEMP_SCALE = 4096.0 / 3.26
+TEMP_TRIP_RAW = 1256           # raw counts at 50 C (firmware disables the PA)
+
+
+def temp_raw_to_c(raw: int) -> float:
+    """Raw 12-bit ADC counts -> degrees C (inverse of the firmware's encoding).
+
+    ⚠ The SAME encoding is used for the PA sensor and for the RPi CPU fallback,
+    so a plausible-looking temperature does NOT tell you which one you are
+    reading. Check has_sensors / fwd-rev-current instead.
+    """
+    return ((raw / _TEMP_SCALE) - 0.5) * 100.0
+
+
+def parse_ep6_telemetry(pkt: bytes):
+    """Decode the response C&C telemetry from an EP6 packet.
+
+    Returns a dict of the fields present in THIS packet's two frames (a single
+    packet may carry one slot, both, or neither), or None if not EP6:
+
+        {"temp_raw": int, "temp_c": float, "fwd": int,      # from the 0x08 slot
+         "rev": int, "current": int,                        # from the 0x10 slot
+         "pa_temp_ok": bool, "cwx": bool, "running": bool,  # C0 low bits
+         "slots": [0x08, 0x10]}
+
+    Absent fields are simply missing — callers should accumulate across packets.
+    Cheap: reads 5 bytes per frame, no IQ decode.
+    """
+    if (len(pkt) < 1032 or pkt[0] != 0xEF or pkt[1] != 0xFE
+            or pkt[2] != 0x01 or pkt[3] != 0x06):
+        return None
+    out = {"slots": []}
+    for fstart in (8, 520):
+        if pkt[fstart:fstart + 3] != SYNC:
+            continue
+        c0 = pkt[fstart + 3]
+        a = (pkt[fstart + 4] << 8) | pkt[fstart + 5]     # C1:C2
+        b = (pkt[fstart + 6] << 8) | pkt[fstart + 7]     # C3:C4
+        slot = c0 & 0xF8
+        out["pa_temp_ok"] = bool(c0 & 0x04)
+        out["cwx"] = bool(c0 & 0x02)
+        out["running"] = bool(c0 & 0x01)
+        if slot == TELEM_SLOT_TEMP_FWD:
+            out["slots"].append(slot)
+            out["temp_raw"] = a
+            out["temp_c"] = temp_raw_to_c(a)
+            out["fwd"] = b
+        elif slot == TELEM_SLOT_REV_CUR:
+            out["slots"].append(slot)
+            out["rev"] = a
+            out["current"] = b
+    return out if out["slots"] else None
+
+
+def swr_from_fwd_rev(fwd: int, rev: int):
+    """SWR from raw forward/reverse readings, or None if it can't be computed.
+
+    Returns None when fwd is 0 (not transmitting, or no sensor) — a caller must
+    treat None as "unknown", NEVER as "good". rev >= fwd would be an infinite
+    SWR; clamp to a large finite number so a UI can render it.
+    """
+    if fwd <= 0 or rev < 0:
+        return None
+    if rev >= fwd:
+        return 99.9
+    g = (rev / fwd) ** 0.5          # reflection coefficient (power ratio -> voltage)
+    if g >= 1.0:
+        return 99.9
+    return min(99.9, (1.0 + g) / (1.0 - g))
+
+
 def ep6_seq(pkt: bytes):
     """Sequence number of an EP6 packet, or None if it isn't one. Cheap — reads
     only the header, no per-sample decode (use when you want seq + iq_samples()
