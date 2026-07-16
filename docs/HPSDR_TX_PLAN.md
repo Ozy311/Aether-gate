@@ -159,15 +159,39 @@ Flagged honestly rather than assumed:
   *continuous at the sample rate* — 48 kHz needs ~63 packets/s, and any gap is a hole in the
   transmitted signal. The current `_cc_loop` 20 Hz sender is **not** a suitable TX pump. Whether
   Python can sustain it reliably on the Pi is **unmeasured** and is the main technical risk.
-- **Radioberry PA — PARTLY ANSWERED (Nigel, 2026-07-16).** His board has a **PA hat with a T/R
-  switch and an I2C-controlled low-pass filter bank** (upstream: https://github.com/pa3gsb/Radioberry-2.x).
-  So a TX chain, T/R switching and band filtering **do exist** — Phase 2/3 are not blocked on
-  "does it transmit at all". **Still unknown and must be established from the hardware/upstream
-  before any RF:** output power, duty-cycle limits, thermal behaviour, and — critically — **whether
-  the I2C LPF bank is selected by the gateware automatically from the TX NCO, or must the HOST
-  select the filter for the band.** If it is host-driven, transmitting without setting the filter
-  means **radiating unfiltered harmonics**, which is both illegal and a good way to kill the PA.
-  That question gates Phase 2. FT8 is 100% duty cycle for 13 s — unforgiving.
+- **⚠⚠ THE LPF BAND-SELECT QUESTION — THE SINGLE BIGGEST TX RISK. NOT SETTLED.**
+  Nigel's board has a **PA hat with a T/R switch and an I2C-controlled low-pass filter bank**
+  (https://github.com/pa3gsb/Radioberry-2.x). TX chain, T/R switching and band filtering **exist** —
+  Phase 2/3 are not blocked on "does it transmit at all".
+
+  **But how the filter gets selected is the thing that can radiate illegal harmonics or kill the PA,
+  and the sources CONFLICT.** Nigel pointed at the HL2 companions
+  (https://github.com/softerhardware/Hermes-Lite2/tree/master/hardware/companions — the N2ADR filter
+  board lives there). The Radioberry borrows the **N2ADR I2C filter design**, but *drives it
+  differently*, and that difference is exactly what matters:
+
+  > "The control of the I2C devices is **not done by the gateware as done in the HL-2** but in the
+  > **firmware by use of the I2C module running on the RPI**." — Radioberry group
+
+  …versus a later account that with the preamp work "the I2C logic must be built into the gateware…
+  with N2ADR filter selection all controlled by the gateware." **Both cannot be true of one board.**
+  This is version-dependent (gateware rev + which hat), and Nigel's board runs **gateware 7.3**
+  (measured). PA3GSB: *"the gateware is verilog as HDL but the filters can be programmed in good old
+  C language"* — which points at host/RPi-side control, i.e. the dangerous case.
+
+  **Why it matters:** if filter selection is host/firmware-driven, then a bare Protocol-1 client (us)
+  that keys MOX **without** selecting the LPF transmits **unfiltered** — harmonics into the antenna.
+  Note our gate talks Protocol-1 **over the network to `10.0.0.224:1024`**; it is NOT the RPi
+  firmware, so *any* RPi-side I2C filter logic is not something we invoke. Whether the Radioberry's
+  own firmware does it for us on TX is **UNVERIFIED**.
+
+  **⛔ HARD GATE: resolve this from the gateware source / PA3GSB directly BEFORE any Phase 2 RF, and
+  do the first key into a DUMMY LOAD with a scope/analyser on the output — verify harmonic
+  suppression empirically rather than trusting either account.** Measure the thing, don't reason
+  about it.
+
+  Still unknown besides: output power, duty-cycle limits, thermal behaviour. FT8 is 100% duty for
+  13 s — unforgiving.
 - **`CONFIG_DUPLEX`** is already set on in `cc_config` (pihpsdr does it unconditionally). Its exact
   TX-side meaning here is unverified.
 - **Sideband convention on TX** — see Phase 3. Unknown until measured.
