@@ -329,6 +329,51 @@ class HpsdrAdapter(RadioAdapter):
         t["swr"] = hp.swr_from_fwd_rev(t.get("fwd", 0), t.get("rev", 0))
         return t
 
+    def read_meters(self):
+        """Adapter seam: per-frame readback for AE's meters.
+
+        S-meter comes from the IQ level as before. fwd_power_w/swr are filled ONLY
+        when the radio actually has the sensors (see telemetry()'s has_sensors) —
+        on a board without them we leave the Meters defaults, and the engine's
+        `swr_is_measured()` check keeps AE's SWR meter from showing a fake 1.0.
+
+        ⚠ fwd is raw ADC counts, NOT watts. We have no calibration constant for
+        this hardware, so converting counts->W would be inventing a number. Until
+        an HL2 is here to calibrate against a known power meter, report 0 W and
+        let SWR (a pure RATIO, which needs no calibration) carry the useful signal.
+        """
+        from ..base import Meters
+        m = Meters()
+        m.s_meter_dbm = self._s_meter_dbm()
+        t = self.telemetry()
+        if t.get("has_sensors"):
+            swr = t.get("swr")
+            if swr is not None:
+                m.swr = swr
+            # fwd_power_w intentionally left 0.0 — see the docstring. Raw counts
+            # are in telemetry()["fwd"] for anyone who wants to calibrate them.
+        return m
+
+    def swr_is_measured(self):
+        """True only if the radio really reports fwd/rev. The engine uses this to
+        decide whether AE's SWR meter shows a real number or nothing at all — an
+        unmeasured 1.0 reads as 'perfect match' and is the exact lie that gets
+        hardware hurt."""
+        return bool(self.telemetry().get("has_sensors"))
+
+    def _s_meter_dbm(self):
+        """Rough S-meter from the latest IQ block's RMS. Uncalibrated (no dBm
+        reference for this front end) — relative, not absolute."""
+        np = self._np
+        if np is None:
+            return -120.0
+        with self._lock:
+            blk = self._latest
+        if blk is None or not len(blk):
+            return -120.0
+        rms = float(np.sqrt(np.mean(np.abs(blk) ** 2))) + 1e-12
+        return max(-140.0, min(0.0, 20.0 * np.log10(rms) - 30.0))
+
     def diagnostics(self):
         """Adapter seam: what the gate sees from the radio (control panel /radio).
 

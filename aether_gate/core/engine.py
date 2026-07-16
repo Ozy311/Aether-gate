@@ -2231,11 +2231,27 @@ class Radio:
                 except Exception:
                     pass
             pw = pw if keyed else 0.0
-            sw = self.tx_swr if keyed else 1.0
+            # SWR: prefer the radio's MEASURED value when it really has fwd/rev
+            # sensors. An adapter that cannot measure SWR must not publish 1.0 —
+            # "perfect match" is the most dangerous possible lie, so we skip the
+            # meter entirely and let AE show no reading rather than a false good
+            # one. (Adapters without swr_is_measured() keep the old behaviour.)
+            sw, swr_real = self.tx_swr, True
+            if self.adapter is not None and hasattr(self.adapter, "swr_is_measured"):
+                try:
+                    swr_real = bool(self.adapter.swr_is_measured())
+                    if swr_real:
+                        m = self.adapter.read_meters()
+                        if m is not None and m.swr:
+                            sw = m.swr
+                except Exception:
+                    swr_real = False
+            sw = sw if keyed else 1.0
             fwd_dbm = 10.0 * math.log10(max(pw, 1e-6)) + 30.0
             try:
                 s.sendto(meter_packet(self.meter_sid, mseq & 0xF, FWDPWR_ID, fwd_dbm), dest); mseq += 1
-                s.sendto(meter_packet(self.meter_sid, mseq & 0xF, SWR_ID, sw), dest); mseq += 1
+                if swr_real:
+                    s.sendto(meter_packet(self.meter_sid, mseq & 0xF, SWR_ID, sw), dest); mseq += 1
             except OSError:
                 pass
             dt = period - (time.time() - now)

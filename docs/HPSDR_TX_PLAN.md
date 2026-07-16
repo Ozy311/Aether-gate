@@ -184,6 +184,38 @@ Build it now against the Radioberry (proves the parse path, RX-only, zero RF ris
 as an SWR/power meter, and it lights up the moment the HL2 is plugged in. **This is the prerequisite
 for every TX guard that follows** — a guard cannot act on a number we do not decode.
 
+### The filter board's own VSWR sensor — Nigel's question, 2026-07-16
+*"there is a vswr meter on the output of the HL2 filter board! im not sure how we use it unless its
+part of the band selection i2c data output?"*
+
+**Good instinct, and the answer is better than the guess: it is NOT part of the band-select write —
+Protocol-1 has a general I2C READ path.** From the HL2 wiki *Protocol*:
+
+- To read from an I2C bus, set the **RQST bit, `C0[7]`**.
+- Second byte `0x07` = read; then the device I2C address and register number.
+- The HL2 "requests four bytes of data from the I2C device and returns the data in **C1, C2, C3, C4**".
+- The response comes back with **ACK=1**, `RDATA` carrying the 4 I2C bytes, `RADDR` matching the
+  original ADDR.
+
+So the band-select I2C write (`0x20`) is one direction; reading a sensor on the same bus is a
+*separate request*, not a side-effect of the filter write. **We would poll it explicitly.**
+
+**Two independent SWR sources on an HL2, then — and they are not redundant:**
+1. **HL2's native fwd/rev** (response regs `0x01`/`0x02`) — measured at the **HL2's own PA output**.
+   Already decoded by Phase 1c (`a1fd077`); free, no extra requests.
+2. **The filter board's VSWR sensor** — measured at the **filter output**, i.e. after the LPF, which
+   is closer to what the antenna actually sees. Reachable via the RQST/`0x07` I2C read.
+
+(1) protects the PA; (2) better reflects the antenna/feedline. Start with (1) — it is already
+working and costs nothing. Add (2) only if the two disagree in a way that matters.
+
+⚠ **Unverified:** the wiki documents the I2C read *mechanism*, but does **not** document a companion
+SWR sensor's I2C address or register map — the wiki text suggests sensor reads are a secondary/future
+use case. **So before building (2): identify the actual sensor part, its I2C address, and its register
+map from the N2ADR schematic (`hardware/companions/n2adr/n2adr.sch`) or from Nigel's board.** Do not
+assume it is I2C-readable at all — it may be an analog line feeding the HL2's own ADC, in which case
+it arrives via (1) anyway. Nigel is the electronics authority here; ask him what the sensor part is.
+
 ### Phase 2 — guarded PTT, DUMMY LOAD ONLY ⚠ FIRST RF — **ON THE HL2, NOT THE RADIOBERRY**
 Port the 9700's four-layer model verbatim in shape:
 - ⛔ **TARGET: the HL2.** It has native fwd/rev/temp/current; the Radioberry PA hat has none. Do not
