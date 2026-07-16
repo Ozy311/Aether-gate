@@ -255,8 +255,24 @@ class KenwoodAdapter(RadioAdapter):
         self._sdr.set_mode(mode)             # local, immediate
 
     def set_span(self, span_hz):
-        # dongle span is fixed by sample rate; nothing to push to the rig.
-        pass
+        """Report the span we ACTUALLY deliver — the dongle's sample rate.
+
+        The dongle's IQ width is fixed by its sample rate; AE's zoom cannot change
+        it (live rate-switching is future work). But we must still TELL AE what it
+        is getting: the engine keeps AE's requested span whenever set_span returns
+        falsy (`_set_pan_span_hz`: `if effective: self.span_mhz = effective/1e6`),
+        so a bare `pass` here made the gate advertise a bandwidth it does not
+        deliver, and `iq_to_dbm` then stretches the block across the pan anyway.
+        AE's frequency axis was simply wrong by (sample_rate / requested_span).
+
+        It went unnoticed at the 2.04 MHz default only because that happens to
+        match AE's default full span, so the ratio was ~1. Narrowing the dongle to
+        250 kHz exposed it: AE kept painting a 2.04 MHz axis with 250 kHz of data.
+
+        Mirrors HpsdrAdapter.set_span, which already returned its sample rate for
+        exactly this reason.
+        """
+        return float(self._sdr.samp_rate)
 
     # --- readback (rig -> AE) -------------------------------------------
     def initial_center_hz(self):
