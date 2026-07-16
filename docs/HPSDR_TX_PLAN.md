@@ -387,10 +387,38 @@ Flagged honestly rather than assumed:
   payload. This is a clean, RF-free win available *before* TX: **decode and display it during RX
   first**, so the telemetry path is proven before it is load-bearing.
 
-  ⚠ Still genuinely unknown: **output power** and **duty-cycle limits** as numbers, and whether
-  Nigel's board actually has the preamp/measure module fitted (`i2c_measure_module_active` gates all
-  of the above — without it the firmware falls back to RPi CPU temp and there is no fwd/rev at all).
-  **Confirm `i2c_measure_module_active` is true on his board before relying on any of it.**
+  ⛔ **MEASURED ON NIGEL'S BOARD 2026-07-16 (live RX, 1903 EP6 packets): the telemetry path WORKS,
+  but `i2c_measure_module_active` is almost certainly FALSE — there is NO fwd/rev/current.**
+
+  ```
+  C0=0x08 (temp/fwd) x1902     C0=0x10 (rev/current) x1904    <- both slots alternate correctly
+    temp        min=1086 max=1104 avg=1099.9   -> 37.5 C
+    fwd pwr     min=0 max=0 avg=0.0
+    rev pwr     min=0 max=0 avg=0.0
+    pa current  min=0 max=0 avg=0.0
+    rb_control  pa_temp_ok=0  CWX=0  running=0   (on EVERY packet)
+  ```
+
+  **Two independent reads of the source agree on why.** The `0x10` branch is emitted
+  *unconditionally*, but `rev`/`pa_current` are only ever written inside `read_I2C_measure()`, which
+  `rb_measure_thread` calls **only** `if (i2c_measure_module_active)`. So permanent zeros = the
+  module is not being read. Likewise `fwd` is only packed inside the `if (i2c_measure_module_active)`
+  branch of the `0x08` slot — our zeros there say the same thing. The 37.5 C we see is therefore the
+  **RPi CPU fallback** (`sys_temp`), not PA temperature.
+  ⚠ Note 37.5 C is *plausible as either*, so temperature alone CANNOT distinguish them — both paths
+  use the same `(4096/3.26)*((C/100)+0.5)` encoding. The fwd/rev/current zeros are the real tell.
+
+  **⛔ This RETRACTS the de-risking claimed above.** `pa_temp_ok=0` on every packet, and the firmware
+  comment says *"if temperature could not be measured the pa is disabled"*. So on this board, as it
+  stands: **no PA thermal protection, no SWR, no PA current.** The 100%-duty FT8 worry is NOT
+  de-risked — it is exactly as open as before, and the fail-safe may mean the PA is disabled outright.
+
+  **Before ANY TX, resolve with Nigel:** is the preamp/measure module physically fitted? Is
+  `i2c_measure_module_active` set in his firmware build/config? Does `pa_temp_ok=0` mean his PA is
+  currently inhibited? If there is genuinely no temp sensing and no SWR, that is a strong argument
+  for keeping this RX-only.
+
+  ⚠ Still unknown regardless: **output power** and **duty-cycle limits** as numbers.
 - **`CONFIG_DUPLEX`** is already set on in `cc_config` (pihpsdr does it unconditionally). Its exact
   TX-side meaning here is unverified.
 - **Sideband convention on TX** — see Phase 3. Unknown until measured.
