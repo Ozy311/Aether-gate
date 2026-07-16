@@ -223,10 +223,32 @@ the **right sideband, right frequency, intelligible, and clean**. Check the spec
 
 Flagged honestly rather than assumed:
 
-- **EP2 TX cadence.** RX needs EP2 only to keep registers latched (20 Hz suffices). TX IQ must be
-  *continuous at the sample rate* — 48 kHz needs ~63 packets/s, and any gap is a hole in the
-  transmitted signal. The current `_cc_loop` 20 Hz sender is **not** a suitable TX pump. Whether
-  Python can sustain it reliably on the Pi is **unmeasured** and is the main technical risk.
+- **EP2 TX cadence — ✅ MEASURED 2026-07-16 ON THE PI. Python sustains it, IF the payload is
+  vectorised.** (RF-free test: every `C0` even → MOX=0 → the radio cannot key.)
+
+  **First, a correction to my own arithmetic:** I said "~63 packets/s at 48 kHz". Wrong — 63 is
+  samples per *frame*. Each 504-B frame holds 63 IQ samples (8 B each: I[3] Q[3] mic[2]), and a
+  packet carries 2 frames = 126 samples. So the real cadence is **rate / 126**:
+
+  | rate | needed | per-sample Python loop | numpy-vectorised |
+  |---|---|---|---|
+  | 48 kHz | 381 pkt/s | 380.9 (100%), 23 late, build 436 µs | **380.9 (100%), 1 late, build 64 µs** |
+  | 192 kHz | 1524 pkt/s | **1410 (92.6%), ALL 8463 late**, overrun median 256 ms | **1523.8 (100%), 0 late, build 89 µs** |
+  | 384 kHz | 3048 pkt/s | not tested | **3047.6 (100%), 3 late, build 81 µs** |
+
+  **The naive per-sample build collapses at 192 kHz** — 436 µs to build against a 656 µs budget, and
+  it fell irrecoverably behind (median overrun 256 ms, i.e. a quarter-second hole in the signal).
+  Replacing the per-sample loop with vectorised numpy byte-slicing drops the build to ~64–89 µs and
+  it **holds 100% at every rate up to 384 kHz**, with 328 µs of budget to spare.
+
+  **So this is no longer the main risk — but it is a hard design constraint:** the TX IQ payload
+  MUST be built with numpy, never a per-sample Python loop. (Note the RX path's `iq_samples()` is
+  exactly such a loop — do NOT mirror it for TX.) The `_cc_loop` 20 Hz sender remains unsuitable as
+  the TX pump; TX needs its own paced sender at rate/126.
+
+  Caveat: this measured **build + sendto pacing** on an idle Pi. It did not measure building IQ from
+  live dax_tx audio (upsample + SSB-modulate per packet) while the RX chain is also running. That
+  combined load is still unmeasured.
 - **⚠⚠ THE LPF BAND-SELECT QUESTION — THE SINGLE BIGGEST TX RISK. NOT SETTLED.**
   Nigel's board has a **PA hat with a T/R switch and an I2C-controlled low-pass filter bank**
   (https://github.com/pa3gsb/Radioberry-2.x). TX chain, T/R switching and band filtering **exist** —
