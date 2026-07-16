@@ -220,7 +220,9 @@ class HpsdrAdapter(RadioAdapter):
             if time.monotonic() - settle_from < SETTLE_S:
                 continue                    # NCO/AGC still settling — drop these
             for i, q in hp.iq_samples(d):
-                buf.append(complex(i, q))
+                buf.append(complex(i, -q))     # conjugate: HPSDR IQ sideband is inverted
+                                               # vs AE's convention (mirrors the spectrum;
+                                               # fixes waterfall alignment + FT8 decode)
             if len(buf) >= BLOCK:
                 # normalise 24-bit -> ~[-1,1] float32 complex for the core FFT
                 blk = np.array(buf[:BLOCK], dtype=np.complex64) / hp.FULL_SCALE
