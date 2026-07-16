@@ -15,6 +15,33 @@ that actually determines how it may be used:
 |---|---|---|---|
 | **Antenna** (own aerial) | a **common name** the operator picks — `"Wideband"`, `"Attic dipole"` | **any** gate | tunable anywhere; contention is arbitration |
 | **IF tap** (a rig's IF out) | **delegated** — the rig's name, `"TS-450S IF"` | **only that rig's** gate | pinned to that rig's IF; not shareable, ever |
+| **Antenna via upconverter** | common name + the converter, `"Dipole via Ham It Up"` | **any** gate | tunable, but every frequency needs an **offset** |
+
+### ⚠ A source's capability is set by its RF CHAIN, not its chip (2026-07-16)
+
+Nigel has a **Ham It Up v1.3** upconverter (RF-only — it sits in the coax between antenna and dongle;
+it has no USB and **can never be seen in software**). That exposes a flaw in my own naming today:
+
+I flashed the generic dongle as **`R820VHF1`** and pinned it to the Yaesu, reasoning "plain R820T, no
+upconverter, tuner floors out ~24 MHz -> it is a VHF/UHF dongle". True of a **bare** dongle. Put the
+Ham It Up in front of it and **it becomes an HF receiver** — the converter shifts HF up by 125 MHz,
+the dongle tunes at `signal + 125 MHz`, and 20m works fine.
+
+**So the name encodes an assumption about the RF chain, and the assumption can be changed with a
+coax lead.** If the Ham It Up is ever fitted in front of `R820VHF1`, the name is a lie.
+
+Consequences for this design:
+- A source needs an **`upconverter_offset_hz`** field (0 for direct, e.g. `+125_000_000` for a Ham It
+  Up). The gate must add it to every tune request and subtract it from every displayed frequency.
+  Without it the panadapter is simply 125 MHz wrong.
+- The **serial identifies the DONGLE; the source identifies the CHAIN.** Those are not the same thing —
+  one dongle moved to a different feed is a different source. Naming the EEPROM serial after an
+  intended role (as I did) bakes today's cabling into the hardware.
+- Better: keep serials **neutral and identity-only** (`NESDR01`, `V4BLOG01`), and let the *source
+  name* in `profiles.json` carry the role and the chain. Then re-cabling is a config edit, not an
+  `rtl_eeprom` reflash.
+  ⚠ **`V4HF0001` / `R820VHF1` as flashed are already role-named — worth re-flashing to neutral names
+  if this design proceeds.**
 
 This is the right cut. It encodes the physical truth once, in the place a human knows it (the setup
 screen), instead of leaving it implicit in three service files that each say `--soapy-driver rtlsdr`
