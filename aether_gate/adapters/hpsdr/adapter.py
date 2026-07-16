@@ -33,11 +33,11 @@ SPEED_HZ = {0: 48_000, 1: 96_000, 2: 192_000, 3: 384_000}
 HZ_SPEED = {v: k for k, v in SPEED_HZ.items()}
 AUDIO_RATE = 24_000          # AE remote_audio_rx rate (must match core AUDIO_RATE)
 CC_INTERVAL_S = 0.05         # EP2 C&C round-robin period (20 Hz) — see _cc_loop.
-                             # Decoupled from EP6 on purpose: the radio free-runs
-                             # the IQ stream, so sends must never pace reads.
-RCVBUF_BYTES = 1 << 20       # 1 MB EP6 socket buffer: absorb scheduling jitter so
-                             # a late drain loses nothing (default is far too small
-                             # for 48-384 kHz of 1032-byte packets)
+                             # Decoupled from EP6 because the radio free-runs the
+                             # IQ stream; sends have no reason to pace reads.
+RCVBUF_BYTES = 1 << 20       # 1 MB EP6 socket buffer — headroom for scheduling
+                             # jitter. Precautionary: the OS default (64 KB here)
+                             # measured no worse, so this is insurance, not a fix.
 
 
 class HpsdrAdapter(RadioAdapter):
@@ -118,8 +118,9 @@ class HpsdrAdapter(RadioAdapter):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        # Big RX buffer BEFORE bind: EP6 free-runs, so anything we don't drain in
-        # time is dropped by the kernel, silently and unrecoverably.
+        # RX buffer headroom BEFORE bind: EP6 free-runs, so anything we fail to
+        # drain in time is dropped by the kernel silently. Not a measured problem
+        # here (the 64 KB default kept up) — cheap insurance on a slower host.
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
         except OSError:
@@ -171,8 +172,8 @@ class HpsdrAdapter(RadioAdapter):
         self._reader = threading.Thread(target=self._read_loop, daemon=True,
                                         name="hpsdr-rx")
         self._reader.start()
-        # EP2 egress runs on its OWN thread: the radio free-runs EP6, so the
-        # reader must never be paced by our sends (see _cc_loop).
+        # EP2 egress on its own thread so our C&C cadence can't gate ingest
+        # (see _cc_loop — structural, not a fix for a measured fault).
         self._sender = threading.Thread(target=self._cc_loop, daemon=True,
                                         name="hpsdr-cc")
         self._sender.start()
@@ -206,15 +207,17 @@ class HpsdrAdapter(RadioAdapter):
     def _cc_loop(self):
         """Round-robin the three C&C registers on our own clock.
 
-        This MUST NOT be driven by EP6 arrivals. HPSDR EP6 is a free-running
-        stream — the radio emits it at the sample rate whether or not we send
-        anything — so pacing sends 1:1 with reads (as the original loop did)
-        throttles the reader to the send rate, overflows the socket buffer, and
-        silently discards most of the stream. Measured on a Radioberry: a
-        coupled loop drained ~4.8 kHz of a nominal 48 kHz (~10x slow), which
-        time-compressed the IQ (WWV landed ~9x off frequency), broke FT8 decode,
-        and starved audio into ~0.5 s on/off bursts. 20 Hz is ample to hold the
-        registers latched; the reader is then free to drain at line rate.
+        DEFENSIVE, not a bug fix — do not claim it repairs a measured fault.
+        HPSDR EP6 free-runs: the radio emits IQ at the sample rate whether or
+        not we send anything, so there is no reason for our C&C cadence to gate
+        the reader. Keeping them separate means a slow or blocked send can never
+        throttle ingest. 20 Hz is ample to hold the registers latched.
+
+        Measured on a Radioberry (10.0.0.224, gateware 7.3): the previous
+        send-then-recv loop ALSO delivered full rate (~49.1 kHz of a nominal
+        48 kHz), so this change fixed no observed starvation. Both shapes
+        measure the same. Keep it because it is the more robust structure, not
+        because it made a number move.
         """
         speed = HZ_SPEED[self.samp_rate]
         # The three registers a working RX needs: config (Mercury+duplex), gain,
