@@ -23,6 +23,23 @@ from .adapters import get_adapter, available
 from .adapters.icom.radios import get as get_icom, lan_radios
 
 
+def wants_setup_ui(raw, environ=None):
+    """Should a bare launch open the Radio Setup page rather than start a gate?
+
+    Bare `python -m aether_gate` opens Setup, which is the right first-run UX at a
+    desktop. But a container or a systemd unit configured entirely through
+    AETHER_GATE_* passes NO argv -- and would then land on the setup page instead
+    of bringing up the radio it was configured for. So an environment that selects
+    an adapter suppresses the page.
+
+    `--setup` always forces it, however the environment is set.
+    """
+    env = os.environ if environ is None else environ
+    if "--setup" in raw:
+        return True
+    return not raw and not env.get("AETHER_GATE_ADAPTER")
+
+
 def apply_env_defaults(ap, environ=None):
     """Let every flag also be supplied as AETHER_GATE_<DEST>.
 
@@ -149,7 +166,7 @@ def main(argv=None):
     # web UI in the browser (pick a radio, hit Start) instead of silently starting the
     # sim. Any explicit adapter flags still run the gate directly (and the launcher
     # spawns children WITH flags, so no recursion).
-    if not raw or "--setup" in raw:
+    if wants_setup_ui(raw):
         from .setup import main as setup_main
         return setup_main()
 

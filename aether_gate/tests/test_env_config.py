@@ -24,7 +24,7 @@ Run:  python -m aether_gate.tests.test_env_config
 import argparse
 import sys
 
-from aether_gate.__main__ import apply_env_defaults
+from aether_gate.__main__ import apply_env_defaults, wants_setup_ui
 
 
 def _parser():
@@ -88,11 +88,37 @@ def test_variable_follows_dest_not_flag_spelling():
     print("ok  env: follows argparse dest (--pass -> AETHER_GATE_PW)")
 
 
+def test_bare_launch_opens_setup():
+    assert wants_setup_ui([], {}) is True
+    print("ok  setup: bare launch with no env opens the Setup page")
+
+
+def test_env_configured_bare_launch_starts_the_gate():
+    """The whole point of env config: a container passes no argv. Without this,
+    `python -m aether_gate` with AETHER_GATE_* set would open the Setup page and
+    never bring up the radio it was configured for."""
+    assert wants_setup_ui([], {"AETHER_GATE_ADAPTER": "icom9700"}) is False
+    print("ok  setup: AETHER_GATE_ADAPTER suppresses the page (containers)")
+
+
+def test_setup_flag_always_wins():
+    assert wants_setup_ui(["--setup"], {"AETHER_GATE_ADAPTER": "icom9700"}) is True
+    print("ok  setup: --setup forces the page even when env selects an adapter")
+
+
+def test_args_still_bypass_setup():
+    assert wants_setup_ui(["--adapter", "sim"], {}) is False
+    print("ok  setup: ordinary CLI args still start the gate")
+
+
 def main():
     tests = [test_env_supplies_a_value, test_unset_env_leaves_defaults_alone,
              test_cli_beats_env, test_type_coercion_still_runs,
              test_store_true_truthy_and_falsey,
-             test_variable_follows_dest_not_flag_spelling]
+             test_variable_follows_dest_not_flag_spelling,
+             test_bare_launch_opens_setup,
+             test_env_configured_bare_launch_starts_the_gate,
+             test_setup_flag_always_wins, test_args_still_bypass_setup]
     for t in tests:
         try:
             t()
