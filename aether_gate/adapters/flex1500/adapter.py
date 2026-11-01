@@ -106,6 +106,7 @@ class Flex1500Adapter(RadioAdapter):
         self._settle_until = 0.0
         self._retune_to = None
         self._ae_center_hz = None
+        self._slice_req_hz = None                  # last slice value set_slice() acted on
         self._seeded = False                       # engine clears it on each AE connect
                                                    # (issue #31): first get_iq() retunes
                                                    # even onto the current centre
@@ -417,9 +418,18 @@ class Flex1500Adapter(RadioAdapter):
 
     def set_slice(self, slice_hz):
         """Demod target. The pan is centred on the LO; if AE puts the slice far
-        off centre (beyond 40% of the span), move the LO onto it."""
+        off centre (beyond 40% of the span), move the LO onto it.
+
+        Asks once per slice value. The engine calls this on every audio frame,
+        and comparing only against the hardware LO re-requested a refused tune
+        each time: found live, 1402 refusals in ~30 s with AE's slice on
+        98.68 MHz (outside coverage).
+        """
         self._slice_hz = float(slice_hz)
+        if self._slice_req_hz is not None and abs(self._slice_hz - self._slice_req_hz) <= 1.0:
+            return
         if self.center_hz is None or abs(self._slice_hz - self.center_hz) > 0.40 * self.samp_rate:
+            self._slice_req_hz = self._slice_hz
             self._retune_to = self._slice_hz
 
     def set_mode(self, mode):

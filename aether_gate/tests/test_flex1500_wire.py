@@ -340,6 +340,31 @@ def test_smeter_ignores_codec_dc():
     print("ok  flex1500: S-meter removes codec DC")
 
 
+def test_adapter_asks_once_per_slice_and_centre():
+    # The engine calls set_slice() every audio frame and get_iq() every pan
+    # frame. A refused tune must be requested once, not every frame.
+    # Kills: comparing to the hardware LO instead of the last request
+    # (found live: 1402 refusals in ~30 s for a slice on 98.68 MHz).
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    a = Flex1500Adapter(center_hz=14_100_000.0)
+    a.set_slice(98_682_540.0)
+    assert a._retune_to == 98_682_540.0
+    a._retune_to = None
+    for _ in range(5):
+        a.set_slice(98_682_540.0)
+    assert a._retune_to is None, a._retune_to
+    a.set_slice(14_090_000.0)                      # 10 kHz off centre: no retune
+    assert a._retune_to is None
+    a._seeded = True
+    a._ae_center_hz = 98_697_900.0
+    for _ in range(5):
+        a.get_iq(1024, 98_697_900.0, 48_000.0)
+    assert a._retune_to is None
+    a.get_iq(1024, 7_074_000.0, 48_000.0)
+    assert a._retune_to == 7_074_000.0
+    print("ok  flex1500: one retune request per slice/centre change")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:
