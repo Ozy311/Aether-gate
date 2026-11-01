@@ -179,10 +179,14 @@ add a udev rule for `2192:1502` yourself; the gate does not install one. Run it 
 The radio is direct conversion, so its codec DC offset shows as a line at the hardware LO (measured
 ~74 dB over the pan median with no antenna). By default the LO sits on the slice, AE's pan is centred on
 the slice and all 48 kHz of it are real data, and a slow (~1 Hz) DC block on the IQ removes the line (with
-it on, no spike was visible at 7.0666 MHz in AE). The DC block's price: a carrier within about a hertz of
-the slice is taken out with the line (measured: 0.5 Hz off -7 dB, 1 Hz -3.5 dB, 3 Hz -0.9 dB, exactly on
-the LO gone), which matters only for an AM carrier or a CW signal tuned to exact zero beat.
-`--flex1500-no-dc-block` turns it off. `--flex1500-if-offset HZ` (2000-16000) is the opt-in alternative:
+it on, no spike was visible at 7.0666 MHz in AE). ⚠️ The DC block's price: a carrier within about a hertz
+of the LO is taken out with the line (measured: 0.5 Hz off -7 dB, 1 Hz -3.5 dB, 3 Hz -0.9 dB, exactly on
+the LO gone). For **AM tuned onto the carrier** that is the normal case, not an edge case: with the carrier
+removed the envelope detector rectifies the sidebands (measured, 50 % modulation at 1 kHz: exactly on the
+carrier no 1 kHz at all, only its 2 kHz rectification; 0.5 Hz off -10 dB with the 2nd harmonic at
+-4 dBc; 1 Hz off -15 dBc; 3 Hz off -34 dBc). A carrier that close needs the radio's own frequency error to
+be under a hertz, so it is most likely on MW and 160 m. For AM, or CW at exact zero beat, use
+`--flex1500-if-offset` (below) or `--flex1500-no-dc-block`, which turns the DC block off. `--flex1500-if-offset HZ` (2000-16000) is the opt-in alternative:
 the LO sits that far off the slice (below it for USB/CW/digital-upper/AM/FM, above for LSB/digital-lower)
 and the IQ is shifted back digitally. Since the pan stays centred on the slice, its cost is HZ of spectrum
 at one edge of the pan that the radio did not sample, shown as floor rather than as aliased signals. The
