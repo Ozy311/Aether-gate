@@ -331,10 +331,10 @@ def test_smeter_ignores_codec_dc():
     n = 4096
     noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) / w.FULL_SCALE
     dc = complex(-147, -55) / w.FULL_SCALE        # conjugated Q, as the adapter stores it
-    a._pan_ring.append((noise + dc).astype(np.complex64))
+    a._pan_ring.append((None, 0, (noise + dc).astype(np.complex64)))   # (lo, idx, iq)
     with_dc = a._s_meter_dbm()
     a._pan_ring.clear()
-    a._pan_ring.append(noise.astype(np.complex64))
+    a._pan_ring.append((None, 0, noise.astype(np.complex64)))
     noise_only = a._s_meter_dbm()
     assert abs(with_dc - noise_only) < 1.0, (with_dc, noise_only)
     print("ok  flex1500: S-meter removes codec DC")
@@ -353,16 +353,146 @@ def test_adapter_asks_once_per_slice_and_centre():
     for _ in range(5):
         a.set_slice(98_682_540.0)
     assert a._retune_to is None, a._retune_to
-    a.set_slice(14_090_000.0)                      # 10 kHz off centre: no retune
-    assert a._retune_to is None
     a._seeded = True
     a._ae_center_hz = 98_697_900.0
     for _ in range(5):
         a.get_iq(1024, 98_697_900.0, 48_000.0)
     assert a._retune_to is None
+    for _ in range(5):                             # set_mode/get_audio repeat every frame
+        a.set_mode("USB")
+    assert a._retune_to is None
+    # A new centre is ONE request. With the default 10 kHz IF offset and USB the
+    # LO goes 10 kHz below the centre (it was the centre itself before offset
+    # tuning, which put the slice on the DC spike).
     a.get_iq(1024, 7_074_000.0, 48_000.0)
-    assert a._retune_to == 7_074_000.0
+    assert a._retune_to == 7_064_000.0, a._retune_to
+    a._retune_to = None
+    for _ in range(5):
+        a.get_iq(1024, 7_074_000.0, 48_000.0)
+    assert a._retune_to is None
+    b = Flex1500Adapter(center_hz=14_100_000.0, if_offset_hz=0)   # offset off = legacy
+    b._seeded = True
+    b._ae_center_hz = 14_100_000.0
+    b.get_iq(1024, 7_074_000.0, 48_000.0)
+    assert b._retune_to == 7_074_000.0, b._retune_to
     print("ok  flex1500: one retune request per slice/centre change")
+
+
+# --- offset tuning: wire.choose_lo (stdlib) ------------------------------------
+_V = 14_074_000.0
+
+
+def test_lo_offset_side_per_mode():
+    # LO below the slice for the upper family, above for the lower family, below
+    # for AM/FM; the slice (pan centre, native-centred) is never on the LO.
+    # Kills: side flipped for LSB, or no offset applied (LO == centre).
+    for mode, want in (("USB", _V - 10_000), ("DIGU", _V - 10_000), ("CW", _V - 10_000),
+                       ("LSB", _V + 10_000), ("DIGL", _V + 10_000), ("CWL", _V + 10_000),
+                       ("AM", _V - 10_000), ("FM", _V - 10_000), ("", _V - 10_000)):
+        got = w.choose_lo(_V, _V, mode, None, 10_000)
+        assert got == want, (mode, got, want)
+        assert w.lo_clearance(got, _V, mode) >= w.LO_GUARD_HZ, mode
+    print("ok  flex1500: LO side per mode (below for USB/CW/AM/FM, above for LSB)")
+
+
+def test_lo_offset_zero_is_legacy():
+    # --flex1500-if-offset 0 must reproduce LO = pan centre exactly.
+    # Kills: an offset applied when the switch says off.
+    assert w.choose_lo(_V, _V, "USB", None, 0) == _V
+    assert w.choose_lo(_V, _V, "LSB", _V, 0) is None
+    assert w.choose_lo(_V + 5.0, _V, "USB", _V, 0) == _V + 5.0
+    print("ok  flex1500: IF offset 0 = LO on the pan centre (legacy)")
+
+
+def _drag(start, stop, step, mode, offset=10_000):
+    """Drag a native-centred slice (centre == slice) in `step` Hz increments,
+    applying every LO the policy asks for. Returns (requests, final_lo, min_clear)."""
+    lo = w.choose_lo(start, start, mode, None, offset)
+    n, f, worst = 0, start, 1e9
+    while (stop - f) * step > 0:
+        f += step
+        new = w.choose_lo(f, f, mode, lo, offset)
+        if new is not None:
+            lo, n = new, n + 1
+        worst = min(worst, w.lo_clearance(lo, f, mode))
+        assert abs(f - lo) <= offset + w.LO_DEAD_EXTRA_HZ, (f, lo)
+    return n, lo, worst
+
+
+def test_lo_hysteresis_on_drag():
+    # A slice drag must not retune every step (each retune drops 150 ms of IQ),
+    # and the passband must never come within the guard of the LO while it moves.
+    # Kills: hysteresis removed (keep-current check dropped -> one request per
+    # step), or the guard check dropped (passband reaches the LO).
+    n_up, _, worst_up = _drag(_V, _V + 50_000, 10.0, "USB")
+    n_dn, _, worst_dn = _drag(_V, _V - 50_000, -10.0, "USB")
+    n_lsb, _, worst_lsb = _drag(_V, _V + 50_000, 10.0, "LSB")
+    # 5000 steps each way; 50 kHz / ~6-8.5 kHz of travel per LO = <= 9 retunes
+    assert 1 <= n_up <= 9 and 1 <= n_dn <= 9 and 1 <= n_lsb <= 9, (n_up, n_dn, n_lsb)
+    assert min(worst_up, worst_dn, worst_lsb) >= w.LO_GUARD_HZ, (worst_up, worst_dn, worst_lsb)
+    # the first 5 kHz of an upward drag costs no retune at all
+    lo = w.choose_lo(_V, _V, "USB", None, 10_000)
+    for k in range(1, 501):
+        assert w.choose_lo(_V + 10 * k, _V + 10 * k, "USB", lo, 10_000) is None, k
+    print(f"ok  flex1500: drag 50 kHz -> {n_up}/{n_dn}/{n_lsb} LO moves, guard held")
+
+
+def test_lo_relax_returns_to_preferred():
+    # After a drag the kept LO may be 15 kHz off; relax asks for the preferred one.
+    # Kills: relax ignored (unsampled edge stays wide after every drag).
+    lo = _V - 10_000
+    f = _V + 5_000
+    assert w.choose_lo(f, f, "USB", lo, 10_000) is None
+    assert w.choose_lo(f, f, "USB", lo, 10_000, relax=True) == f - 10_000
+    assert w.choose_lo(f, f, "USB", f - 10_000, 10_000, relax=True) is None
+    print("ok  flex1500: relax returns the LO to its preferred offset")
+
+
+def test_lo_coverage_edges_no_storm():
+    # At the coverage edges the preferred side can fall outside 0.49-54 MHz:
+    # flip to the other side, and once applied ask nothing more. Out of coverage
+    # entirely: ask once for the centre (so _apply_tune refuses it and says so),
+    # then nothing. Kills: coverage ignored in lo_ok (requests an LO the radio
+    # cannot take), or a re-request on every evaluation (the 1402x storm).
+    lo = w.choose_lo(495_000.0, 495_000.0, "USB", None, 10_000)
+    assert lo == 505_000.0 and w.in_rx_coverage(lo), lo
+    assert w.choose_lo(495_000.0, 495_000.0, "USB", lo, 10_000) is None
+    hi = w.choose_lo(53_995_000.0, 53_995_000.0, "LSB", None, 10_000)
+    assert hi == 53_985_000.0 and w.in_rx_coverage(hi), hi
+    assert w.choose_lo(53_995_000.0, 53_995_000.0, "LSB", hi, 10_000) is None
+    far = 98_682_540.0
+    assert w.choose_lo(far, far, "USB", 14_064_000.0, 10_000) == far
+    assert w.choose_lo(far, far, "USB", far, 10_000) is None
+    print("ok  flex1500: coverage edges flip side; out of coverage asks once")
+
+
+def test_if_offset_validation():
+    # Kills: accepting an offset that leaves no guard (1 kHz) or a pan mostly unsampled.
+    assert w.check_if_offset(0) == 0 and w.check_if_offset(10_000) == 10_000
+    for bad in (1_000, 20_000, -5_000):
+        try:
+            w.check_if_offset(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"IF offset {bad} accepted")
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    try:
+        Flex1500Adapter(if_offset_hz=500)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("adapter accepted a 500 Hz IF offset")
+    print("ok  flex1500: IF offset validated (0 or 2-16 kHz)")
+
+
+def test_cli_switches_reach_the_adapter():
+    # Kills: the flags parsed but not passed through (A/B switch silently inert).
+    from aether_gate import __main__ as m
+    src = open(m.__file__, encoding="utf-8").read()
+    assert "--flex1500-no-dc-block" in src and "--flex1500-if-offset" in src
+    assert "dc_block=not args.flex1500_no_dc_block" in src
+    assert "if_offset_hz=args.flex1500_if_offset" in src
+    print("ok  flex1500: --flex1500-no-dc-block / --flex1500-if-offset wired")
 
 
 def main():

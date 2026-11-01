@@ -29,6 +29,14 @@ its own PR carrying the CONSTITUTION §I safety story (arm latch, band whitelist
 stuck-PTT watchdog, unkey on disconnect, and what happens when intent is
 ambiguous).
 
+DC and offset tuning. The codec's DC offset shows at the hardware LO (~70 dB
+over the pan's median, measured). Two independent remedies, both on by default
+and each switchable for A/B (--flex1500-no-dc-block, --flex1500-if-offset 0):
+a ~1 Hz block-wise DC block on the raw IQ before the pan and the demod, and
+offset tuning (wire.choose_lo): the LO sits off the slice's passband, the IQ is
+shifted back digitally, and the |shift| Hz edge of the pan the radio did not
+sample is zeroed, not aliased.
+
 §II — what is a reading and what is not. The firmware revision, serial number
 and status byte are replies from the radio. The filter, preamp and LO are
 COMMANDED values: the radio's SPI bus is outbound only, so there is no read-back
@@ -43,12 +51,14 @@ On Linux the device node is root-owned by default: run under sudo or add a udev
 rule for 2192:1502 (the gate does not install one).
 """
 import collections
+import math
 import threading
 import time
 
 from ..base import RadioAdapter, AdapterCaps, Meters
 from ...core.fft import dbm_offset_for   # stdlib-safe: numpy is optional there
 from . import wire
+from . import dsp
 
 AUDIO_RATE = 24_000          # AE remote_audio_rx rate (must match core AUDIO_RATE)
 N_ISO_XFERS = 8              # iso transfers kept in flight
@@ -60,6 +70,9 @@ STALL_S = 0.5                # no iso packet for this long -> note_device_silent
 PAN_RING_BLOCKS = 64         # ~49k samples (~1 s) of recent IQ for get_iq(n)
 AUDIO_Q_BLOCKS = 128         # ~2 s of IQ queued for the demodulator
 METER_SAMPLES = 4096
+RELAX_S = 2.0                # once the slice has been still this long, move the
+                             # LO back to its preferred offset (one retune per
+                             # drag, at the end of it)
 
 # The ham bands the radio's RX filters and TX coverage are built around
 # (service manual / datasheet: 160-6 m), in AE BandDefs names.
@@ -73,8 +86,11 @@ class Flex1500Adapter(RadioAdapter):
     provides = "iq"
 
     def __init__(self, preamp_db=0, center_hz=14_100_000.0, model="FLEX-6600",
-                 serial="", station="FLEX-1500"):
+                 serial="", station="FLEX-1500", dc_block=True,
+                 if_offset_hz=wire.IF_OFFSET_HZ):
         self.samp_rate = wire.SAMPLE_RATE
+        self.dc_block = bool(dc_block)
+        self.if_offset_hz = wire.check_if_offset(if_offset_hz)   # refuse a bad value early
         self.preamp_db = int(preamp_db)
         wire.preamp_code(self.preamp_db)           # refuse a non-step at construction
         self.center_hz = float(center_hz)          # last LO the radio ACCEPTED
@@ -82,8 +98,9 @@ class Flex1500Adapter(RadioAdapter):
         self.filter_index = None                   # last RX1 filter accepted
         self._serial_override = serial
         # FLEX-6600 = HF + 6 m (RADIO_SUPPORT.md). Span is the real 48 kHz: one
-        # sample rate, no zoom in hardware, so min == max. The pan is always
-        # centred on the LO (direct conversion), hence native_centered_scope.
+        # sample rate, no zoom in hardware, so min == max. native_centered_scope:
+        # the engine centres AE's pan on the slice; the IQ is shifted digitally
+        # so its bins are labelled for that centre whatever the hardware LO is.
         self.capabilities = AdapterCaps(model=model, serial=serial, station=station,
                                         tx_capable=False, native_centered_scope=True,
                                         min_span_hz=float(wire.SAMPLE_RATE),
@@ -110,6 +127,15 @@ class Flex1500Adapter(RadioAdapter):
         self._seeded = False                       # engine clears it on each AE connect
                                                    # (issue #31): first get_iq() retunes
                                                    # even onto the current centre
+        # --- offset tuning / DC block state ---
+        self._lo_lock = threading.Lock()
+        self._lo_req = None                        # last LO requested (or applied)
+        self._lo_inputs = None                     # (centre, slice, mode) last evaluated
+        self._lo_changed_at = 0.0                  # when those inputs last changed
+        self._relaxed = True                       # relax already done for these inputs
+        self._dc = dsp.DcBlocker(wire.SAMPLE_RATE)
+        self._sample_idx = 0                       # samples since the current LO was set
+        self.retunes_requested = 0
         self._last_pkt = 0.0
         self.fw_rev = None
         self.serial_num = None
@@ -130,6 +156,9 @@ class Flex1500Adapter(RadioAdapter):
         self._decim = None
         self._stage_firs = []
         self._iq_resid = None
+        self._resid_lo = None                      # LO the residual samples were taken at
+        self._ssb_usb = None
+        self._ssb_state = None
         self._audio_gain = 4.0
         self._agc_level = 0.05
         self._agc_target = 0.25
@@ -214,6 +243,11 @@ class Flex1500Adapter(RadioAdapter):
             taps = (taps / taps.sum()).astype(np.float64)
             self._stage_firs.append([taps, np.zeros(ntaps - 1, dtype=np.complex128), M])
         self._iq_resid = np.zeros(0, dtype=np.complex64)
+        # Sideband filter at the audio rate. Without it real() kept both
+        # sidebands (real(conj(z)) == real(z): USB and LSB were identical) and
+        # the DC line, offset-tuned 10 kHz away, still folded into the audio.
+        self._ssb_usb = dsp.ssb_taps(AUDIO_RATE, np, pass_hz=wire.SSB_PASS_HZ)
+        self._ssb_state = np.zeros(len(self._ssb_usb) - 1, dtype=np.complex128)
 
         # Start the IQ stream: submitting iso IN transfers is all it takes.
         for _ in range(N_ISO_XFERS):
@@ -227,16 +261,20 @@ class Flex1500Adapter(RadioAdapter):
         self._chan.write_op(wire.OP_SET_TRX_PREAMP, wire.preamp_code(self.preamp_db))
         start_hz = self.center_hz
         self.center_hz = None
-        if not self._apply_tune(start_hz):
-            raise RuntimeError(f"could not tune the FLEX-1500 to {start_hz / 1e6:.6f} MHz")
+        start_lo = wire.choose_lo(start_hz, self._slice_hz, self._mode, None,
+                                  self.if_offset_hz)
+        self._lo_req = start_lo
+        if not self._apply_tune(start_lo):
+            raise RuntimeError(f"could not tune the FLEX-1500 to {start_lo / 1e6:.6f} MHz")
 
         self._ctl_thread = threading.Thread(target=self._ctl_loop, daemon=True,
                                             name="flex1500-ctl")
         self._ctl_thread.start()
         print(f"[flex1500] firmware {wire.fw_rev_str(fw)}, serial "
               f"{self.capabilities.serial or '?'}, LO {self.center_hz / 1e6:.6f} MHz, "
-              f"filter {self.filter_index}, preamp {self.preamp_db:+d} dB (RX only)",
-              flush=True)
+              f"filter {self.filter_index}, preamp {self.preamp_db:+d} dB, "
+              f"DC block {'on' if self.dc_block else 'off'}, IF offset "
+              f"{self.if_offset_hz} Hz (RX only)", flush=True)
 
     def close(self):
         self._run = False
@@ -309,11 +347,7 @@ class Flex1500Adapter(RadioAdapter):
                 self._last_pkt = time.monotonic()
                 self.note_device_alive()
                 if time.monotonic() >= self._settle_until:
-                    blk = wire.iq_from_packet(b"".join(good), self._np)
-                    with self._lock:
-                        self._pan_ring.append(blk)
-                        self._latest = blk
-                    self._audio_q.append(blk)
+                    self._ingest(wire.iq_from_packet(b"".join(good), self._np))
         elif st == usb1.TRANSFER_CANCELLED:
             return
         elif st == usb1.TRANSFER_NO_DEVICE:
@@ -328,6 +362,24 @@ class Flex1500Adapter(RadioAdapter):
                 self._lost("the FLEX-1500 left the USB bus (unplugged or powered off)")
             except Exception:
                 self.iso_resubmit_errors += 1
+
+    def _ingest(self, blk):
+        """One block of raw IQ in: DC estimate (always, for diagnostics), DC
+        removal when on, then into the pan ring and the demod queue tagged with
+        the LO it was captured at and its sample index since that LO was set,
+        so a reader never labels old-LO samples with a new LO."""
+        np = self._np
+        with self._lock:
+            lo = self.lo_hz
+            if self.dc_block:
+                blk = self._dc.process(blk, np)
+            else:
+                self._dc.update(blk, np)
+            idx = self._sample_idx
+            self._sample_idx += len(blk)
+            self._pan_ring.append((lo, idx, blk))
+            self._latest = blk
+        self._audio_q.append((lo, blk))
 
     def _on_int(self, x):
         usb1 = self._usb1
@@ -354,6 +406,7 @@ class Flex1500Adapter(RadioAdapter):
     # --- control thread: applies retunes off the engine's frame loop --------
     def _ctl_loop(self):
         while self._run:
+            self._maybe_relax(time.monotonic())
             hz = self._retune_to
             if hz is not None:
                 self._retune_to = None
@@ -382,6 +435,9 @@ class Flex1500Adapter(RadioAdapter):
             return False
         idx = wire.rx_filter_index(hz)
         tw = wire.tuning_word(hz)
+        # Hold ingest off BEFORE the writes: a block landing between the TW
+        # write and the ring clear would otherwise carry old-LO samples.
+        self._settle_until = time.monotonic() + SETTLE_S
         try:
             self._chan.write_op(wire.OP_SET_RX1_FILTER, idx)
             self.filter_index = idx
@@ -392,19 +448,65 @@ class Flex1500Adapter(RadioAdapter):
             self.tune_failed += 1
             print(f"[flex1500] tune {hz / 1e6:.6f} MHz failed: {e}", flush=True)
             return False
-        self.center_hz = hz
-        self.lo_hz = wire.lo_hz_from_tw(tw)
         self.tune_ok += 1
         with self._lock:
+            self.center_hz = hz
+            self.lo_hz = wire.lo_hz_from_tw(tw)
             self._pan_ring.clear()
             self._latest = None
+            self._sample_idx = 0
+            self._dc.reset()                       # the codec DC can move with the LO
         self._audio_q.clear()
         self._settle_until = time.monotonic() + SETTLE_S
         return True
 
     # --- control (AE -> radio) ------------------------------------------
+    #
+    # Where the hardware LO goes is decided in ONE place, _evaluate_lo(), from
+    # (pan centre, slice, mode) via wire.choose_lo(), and only when one of
+    # those inputs changes (or once, when the slice has been still RELAX_S).
+    # The engine calls set_slice()/set_mode() every audio frame and get_iq()
+    # every pan frame; deciding per call is what produced the 1402-refusal
+    # retune storm, so every entry point below dedupes on its input first.
+    def _evaluate_lo(self, force=False):
+        with self._lo_lock:
+            center = self._ae_center_hz if self._ae_center_hz is not None else self._slice_hz
+            inputs = (center, self._slice_hz, self._mode)
+            if not force and inputs == self._lo_inputs:
+                return
+            self._lo_inputs = inputs
+            self._lo_changed_at = time.monotonic()
+            self._relaxed = False
+            cur = None if force else self._lo_req
+            lo = wire.choose_lo(center, self._slice_hz, self._mode, cur, self.if_offset_hz)
+            if lo is not None:
+                self._lo_req = lo
+                self._retune_to = lo
+                self.retunes_requested += 1
+
+    def _maybe_relax(self, now):
+        """After a drag the hysteresis may leave the LO far from its preferred
+        offset (a wide unsampled pan edge). Once the inputs have been still for
+        RELAX_S, ask for the preferred LO once; never again until they change."""
+        with self._lo_lock:
+            if self._relaxed or self._lo_inputs is None or not self.if_offset_hz:
+                return
+            if now - self._lo_changed_at < RELAX_S:
+                return
+            self._relaxed = True
+            center, slice_hz, mode = self._lo_inputs
+            lo = wire.choose_lo(center, slice_hz, mode, self._lo_req, self.if_offset_hz,
+                                relax=True)
+            if lo is not None:
+                self._lo_req = lo
+                self._retune_to = lo
+                self.retunes_requested += 1
+
     def retune(self, center_hz):
-        self._retune_to = float(center_hz)
+        """AE wants the pan centred on `center_hz`. The hardware LO follows the
+        offset policy; the pan is relabelled digitally."""
+        self._ae_center_hz = float(center_hz)
+        self._evaluate_lo()
 
     def set_span(self, span_hz):
         """One sample rate, so the span is always 48 kHz whatever AE asks."""
@@ -417,24 +519,22 @@ class Flex1500Adapter(RadioAdapter):
         return float(self.samp_rate)
 
     def set_slice(self, slice_hz):
-        """Demod target. The pan is centred on the LO; if AE puts the slice far
-        off centre (beyond 40% of the span), move the LO onto it.
-
-        Asks once per slice value. The engine calls this on every audio frame,
-        and comparing only against the hardware LO re-requested a refused tune
-        each time: found live, 1402 refusals in ~30 s with AE's slice on
-        98.68 MHz (outside coverage).
-        """
-        self._slice_hz = float(slice_hz)
-        if self._slice_req_hz is not None and abs(self._slice_hz - self._slice_req_hz) <= 1.0:
+        """Demod target. Asks for an LO decision only when the slice moves by
+        more than 1 Hz: the engine calls this on every audio frame, and
+        re-deciding each time re-requested a refused tune each time (found
+        live: 1402 refusals in ~30 s with AE's slice on 98.68 MHz)."""
+        slice_hz = float(slice_hz)
+        if self._slice_req_hz is not None and abs(slice_hz - self._slice_req_hz) <= 1.0:
+            self._slice_hz = slice_hz
             return
-        if self.center_hz is None or abs(self._slice_hz - self.center_hz) > 0.40 * self.samp_rate:
-            self._slice_req_hz = self._slice_hz
-            self._retune_to = self._slice_hz
+        self._slice_req_hz = slice_hz
+        self._slice_hz = slice_hz
+        self._evaluate_lo()
 
     def set_mode(self, mode):
-        if mode:
+        if mode and mode.upper() != self._mode:
             self._mode = mode.upper()
+            self._evaluate_lo()
 
     # --- readback (radio -> AE) -----------------------------------------
     def read_meters(self):
@@ -443,10 +543,13 @@ class Flex1500Adapter(RadioAdapter):
         panadapter (core.fft.dbm_offset_for with the engine's defaults), so pan
         and meter agree with each other, not with a reference.
 
-        The block mean is removed first: with no antenna the codec's DC offset
-        (measured about -147 / +55 counts on I / Q) sits some 45 dB above the
-        ~1 LSB noise, so a raw RMS would report the DC offset, not the signal.
-        noise_dbm stays None — this adapter does not separate signal from noise.
+        Measured over the demodulated passband (slice - LO, the mode's
+        sideband), so it follows the real LO and the digital shift: with the LO
+        offset, the DC line is outside that band. The block mean is removed
+        first as well, for when the DC block is switched off: with no antenna
+        the codec's DC offset (measured about -147 / +55 counts on I / Q) sits
+        some 45 dB above the ~1 LSB noise. noise_dbm stays None — this adapter
+        does not separate signal from noise.
         """
         return Meters(s_meter_dbm=self._s_meter_dbm())
 
@@ -454,16 +557,40 @@ class Flex1500Adapter(RadioAdapter):
         np = self._np
         if np is None:
             return -140.0
-        blk = self._recent(METER_SAMPLES)
-        if blk is None or not len(blk):
+        got = self._recent(METER_SAMPLES)
+        if got is None:
             return -140.0
-        x = blk - blk.mean()
-        rms = float(np.sqrt(np.mean(np.abs(x) ** 2))) + 1e-12
-        dbm = 20.0 * np.log10(rms) + dbm_offset_for(20.0)
+        blk, lo, _ = got
+        if not len(blk):
+            return -140.0
+        x = (blk - blk.mean()).astype(np.complex128)
+        w = np.hanning(len(x))
+        X = np.fft.fft(x * w)
+        f = np.fft.fftfreq(len(x), 1.0 / self.samp_rate)
+        (a, b), _ = wire.mode_passband(self._mode)
+        if self._mode in wire.SYMMETRIC_MODES:
+            a, b = 0, wire.SSB_PASS_HZ            # the demod passes the upper side only
+        f_off = self._slice_hz - (lo if lo is not None else self._slice_hz)
+        band = (f >= f_off + a) & (f <= f_off + b)
+        # Parseval with the window's energy: the band's mean-square amplitude.
+        p = float(np.sum(np.abs(X[band]) ** 2)) / (len(x) * float(np.sum(w * w)))
+        dbm = 10.0 * np.log10(p + 1e-24) + dbm_offset_for(20.0)
         return max(-140.0, min(0.0, dbm))
+
+    def _dc_counts(self):
+        """The DC estimate in raw codec counts (I, Q as the radio sent them:
+        the adapter stores Q negated, so it is negated back here)."""
+        dc = self._dc.dc
+        if dc is None:
+            return None
+        return (round(dc.real * wire.FULL_SCALE, 1), round(-dc.imag * wire.FULL_SCALE, 1))
 
     def diagnostics(self):
         st = self._chan.last_status if self._chan else None
+        center = self._ae_center_hz
+        shift = (self.lo_hz - center) if (self.lo_hz is not None and center is not None) else None
+        dead = dsp.unsampled_band(shift, self.samp_rate) if shift else None
+        dc = self._dc_counts()
         d = {
             "radio": "FLEX-1500",
             "link": {"transport": "usb", "host": f"{wire.VID:04x}:{wire.PID:04x} iface {wire.INTERFACE}",
@@ -477,11 +604,33 @@ class Flex1500Adapter(RadioAdapter):
             "commanded_note": ("filter / preamp / LO are what the gate SENT and the "
                                "radio accepted over USB; the FLEX-1500 has no read-back "
                                "for them (outbound-only SPI)"),
+            # Offset tuning (derived, not read from the radio): the pan AE asked
+            # for vs. the LO the radio runs, and what that costs.
+            "tuning": {
+                "hw_lo_hz": self.lo_hz,
+                "pan_center_hz": center,
+                "slice_hz": self._slice_hz, "mode": self._mode,
+                "if_offset_hz": self.if_offset_hz,
+                "digital_shift_hz": round(shift, 3) if shift is not None else None,
+                "digital_shift_note": ("hw_lo_hz - pan_center_hz; the IQ is shifted by "
+                                       "this so bins are labelled for the pan centre"),
+                "unsampled_edge_hz": ([round(dead[0]), round(dead[1])] if dead else None),
+                "unsampled_edge_note": ("baseband range (relative to the pan centre) the "
+                                        "radio did not sample; zeroed in the pan, not aliased"),
+                "retunes_requested": self.retunes_requested,
+            },
+            "dc_block": {
+                "on": self.dc_block, "corner_hz": dsp.DC_CORNER_HZ,
+                "dc_before_removal_counts": ({"i": dc[0], "q": dc[1]} if dc else None),
+                "dc_before_removal_dbfs": (round(20.0 * math.log10(
+                    max(abs(self._dc.dc), 1e-12)), 1) if dc else None),
+                "note": "measured from the IQ (running estimate), before removal",
+            },
             "status_byte": f"0x{st:02x}" if st is not None else None,
             "status_inputs": wire.decode_status(st) if st is not None else None,
             "samp_rate": self.samp_rate,
             "meters": {"s_meter_dbm": round(self._s_meter_dbm(), 1),
-                       "note": "derived from IQ, uncalibrated"},
+                       "note": "derived from IQ over the slice passband, uncalibrated"},
             "counters": {
                 "iso_packets": self.iso_packets, "iso_errors": self.iso_errors,
                 "iso_resubmit_errors": self.iso_resubmit_errors,
@@ -493,33 +642,41 @@ class Flex1500Adapter(RadioAdapter):
                 "tune_ok": self.tune_ok, "tune_refused": self.tune_refused,
                 "tune_failed": self.tune_failed},
             "tx": "not supported by this adapter (RX only)",
-            # Measured 2026-11-01 (no antenna): the codec's DC offset shows as a
-            # spike at the LO ~70 dB over the pan's median. Not removed here —
-            # the slice sits on the LO, so how to handle it (DC blocker vs
-            # offset tuning) is an open design choice, and the audio path has
-            # not been exercised live.
-            "known_artifacts": ("DC spike at the LO (codec DC offset, ~70 dB over the "
-                                "median, not removed); 38.4 MHz TCXO leaks into RX ~15-20 dB "
-                                "above the floor; a fixed baseband pair near +/-19.4 kHz is "
-                                "not RF (does not move with the LO)"),
+            "known_artifacts": ("codec DC offset at the hardware LO (~70 dB over the "
+                                "median raw, measured 2026-11-01): removed by the DC "
+                                "block and kept out of the slice passband by the IF "
+                                "offset when those are on; with the offset on, "
+                                "|digital_shift_hz| at one pan edge is unsampled and "
+                                "shown as floor; 38.4 MHz TCXO leaks into RX ~15-20 dB "
+                                "above the floor; a fixed baseband pair near +/-19.4 kHz "
+                                "is not RF (does not move with the LO)"),
         }
         return d
 
     # --- the IQ source --------------------------------------------------
     def _recent(self, n):
-        """The newest n samples (or fewer, if that is all there is)."""
+        """The newest n samples captured at ONE LO (or fewer, if that is all
+        there is), as (samples, lo_hz, start_idx); None if the ring is empty."""
         with self._lock:
             blocks = list(self._pan_ring)
         if not blocks:
             return None
+        lo0 = blocks[-1][0]
         take, have = [], 0
-        for b in reversed(blocks):
-            take.append(b)
+        for lo, idx, b in reversed(blocks):
+            if lo != lo0:
+                break
+            take.append((idx, b))
             have += len(b)
             if have >= n:
                 break
-        blk = take[0] if len(take) == 1 else self._np.concatenate(list(reversed(take)))
-        return blk[-n:]
+        take.reverse()
+        blk = take[0][1] if len(take) == 1 else self._np.concatenate([b for _, b in take])
+        start = take[0][0]
+        if len(blk) > n:
+            start += len(blk) - n
+            blk = blk[-n:]
+        return blk, lo0, start
 
     def get_iq(self, n, center_hz, span_hz):
         # Follow AE's centre, comparing AE-to-AE (soapy's lesson): comparing to
@@ -527,13 +684,29 @@ class Flex1500Adapter(RadioAdapter):
         if not self._seeded:
             self._seeded = True
             self._ae_center_hz = float(center_hz)
-            self.retune(center_hz)
-        elif abs(center_hz - self._ae_center_hz) > 1.0:
-            self._ae_center_hz = float(center_hz)
+            self._evaluate_lo(force=True)
+        elif self._ae_center_hz is None or abs(center_hz - self._ae_center_hz) > 1.0:
             self.retune(center_hz)
         # Serve the length asked for, so the advertised bin width is real
         # (CONSTITUTION §VI: never ignore n).
-        return self._recent(max(1, int(n)))
+        got = self._recent(max(1, int(n)))
+        if got is None:
+            return None
+        blk, lo, start = got
+        return self._relabel(blk, lo, start, float(center_hz))
+
+    def _relabel(self, blk, lo, start, center_hz):
+        """Shift IQ captured at `lo` so its bins read correctly for `center_hz`,
+        and zero the edge the radio never sampled (dsp.mask_unsampled)."""
+        if lo is None:
+            return blk
+        shift = lo - center_hz
+        if abs(shift) < 0.5:
+            return blk
+        np = self._np
+        y = dsp.nco_shift(blk, shift, start, self.samp_rate, np)
+        y = dsp.mask_unsampled(y, shift, self.samp_rate, np)
+        return y.astype(np.complex64)
 
     # --- the AUDIO source (SSB demod, adapted from hpsdr; numpy only) ------
     @staticmethod
@@ -549,25 +722,41 @@ class Flex1500Adapter(RadioAdapter):
 
     def get_audio(self, n_samples, slice_hz=None, mode=None):
         """n_samples of 24 kHz mono audio from the live IQ, or None until enough
-        is buffered. Mix the slice to baseband, decimate 48k -> 24k, take the
-        real part (USB) / conj-real (LSB), light AGC — as hpsdr does."""
+        is buffered. Mix the slice to baseband (against the LO the samples were
+        captured at), decimate 48k -> 24k, sideband filter, real part, light AGC."""
         np = self._np
         if np is None or not self._stage_firs:
             return None
         if slice_hz is not None:
             self.set_slice(slice_hz)
         if mode is not None:
-            self._mode = mode.upper()
+            self.set_mode(mode)
 
         need_in = n_samples * self._decim
         while len(self._iq_resid) < need_in and self._audio_q:
-            self._iq_resid = np.concatenate([self._iq_resid, self._audio_q.popleft()])
+            lo, b = self._audio_q.popleft()
+            if lo != self._resid_lo:               # a retune: never splice two LOs
+                self._iq_resid = np.zeros(0, dtype=np.complex64)
+                self._resid_lo = lo
+            self._iq_resid = np.concatenate([self._iq_resid, b])
         if len(self._iq_resid) < need_in:
             return None
-        iq = self._iq_resid[:need_in].astype(np.complex128)
+        iq = self._iq_resid[:need_in]
         self._iq_resid = self._iq_resid[need_in:]
+        audio = self._demod(iq, self._resid_lo, n_samples)
+        audio = audio * self._audio_gain
+        rms = float(np.sqrt(np.mean(audio * audio)) + 1e-9)
+        a = 0.3 if rms > self._agc_level else 0.02
+        self._agc_level = (1 - a) * self._agc_level + a * rms
+        audio = audio * (self._agc_target / max(self._agc_level, 1e-4))
+        np.clip(audio, -1.0, 1.0, out=audio)
+        return audio.tolist()
 
-        f_off = self._slice_hz - (self.center_hz or self._slice_hz)
+    def _demod(self, iq, lo, n_samples):
+        """Pre-AGC audio (24 kHz, float64) for IQ captured at `lo`."""
+        np = self._np
+        iq = np.asarray(iq, dtype=np.complex128)
+        f_off = self._slice_hz - (lo if lo is not None else self._slice_hz)
         k = np.arange(len(iq))
         ph = self._nco_phase + 2.0 * np.pi * (-f_off) / self.samp_rate * k
         iq = iq * np.exp(1j * ph)
@@ -584,15 +773,8 @@ class Flex1500Adapter(RadioAdapter):
         if len(base) < n_samples:
             base = np.concatenate([base, np.zeros(n_samples - len(base), dtype=base.dtype)])
 
-        if self._mode.startswith("LSB"):
-            audio = np.real(np.conj(base))
-        else:
-            audio = np.real(base)
-
-        audio = audio * self._audio_gain
-        rms = float(np.sqrt(np.mean(audio * audio)) + 1e-9)
-        a = 0.3 if rms > self._agc_level else 0.02
-        self._agc_level = (1 - a) * self._agc_level + a * rms
-        audio = audio * (self._agc_target / max(self._agc_level, 1e-4))
-        np.clip(audio, -1.0, 1.0, out=audio)
-        return audio.tolist()
+        taps = np.conj(self._ssb_usb) if self._mode in wire.LOWER_MODES else self._ssb_usb
+        x = np.concatenate([self._ssb_state, base])
+        y = np.convolve(x, taps, mode="valid")
+        self._ssb_state = x[len(x) - (len(taps) - 1):]
+        return np.real(y)

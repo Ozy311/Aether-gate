@@ -368,3 +368,116 @@ class CommandChannel:
             with self._cv:
                 self._replies[r[2]] = r
                 self._cv.notify_all()
+
+
+# --- offset tuning: where the hardware LO goes (pure, stdlib) -------------------
+#
+# The codec's DC offset (measured -147 / +55 counts on I / Q with no antenna,
+# ~70 dB over the pan's median) sits exactly at the hardware LO. The engine
+# centres AE's pan on the slice (native_centered_scope), so an LO equal to the
+# pan centre puts every slice on top of it. Offset tuning moves the LO off the
+# slice's audio passband and the adapter shifts the IQ digitally so the pan
+# stays labelled for the centre AE asked for. Prior art: PowerSDR (GPL, app
+# code console.cs) tuned the FLEX-1500's DDS 3.8 kHz off the dial and shifted
+# digitally, so the DC line stayed visible but outside the passband. This is
+# our own implementation of that idea, not a copy.
+#
+# The cost is honest and fixed: the radio samples LO +/- 24 kHz, the pan is
+# centre +/- 24 kHz, so |LO - centre| Hz at one edge of the pan were never
+# sampled. The adapter zeroes that edge (dsp.mask_unsampled) rather than let the
+# wrapped alias paint signals that are not there.
+
+IF_OFFSET_HZ = 10_000          # default LO offset from the pan centre
+IF_OFFSET_MIN_HZ = 2_000       # 0 = off; otherwise within these bounds
+IF_OFFSET_MAX_HZ = 16_000
+LO_GUARD_HZ = 1_500            # the passband may come no closer to the LO than this
+LO_DEAD_EXTRA_HZ = 6_000       # hysteresis: tolerate |LO - centre| up to offset + this
+LO_USABLE_HZ = 20_000          # passband must stay inside LO +/- this (codec roll-off)
+SSB_PASS_HZ = 3_000            # the demod's sideband filter width (adapter get_audio)
+
+LOWER_MODES = ("LSB", "DIGL", "CWL")
+SYMMETRIC_MODES = ("AM", "SAM", "FM", "NFM", "DFM", "FM-N")
+
+
+def check_if_offset(hz):
+    """The IF offset in whole Hz; 0 turns offset tuning off. ValueError otherwise."""
+    hz = int(hz)
+    if hz != 0 and not IF_OFFSET_MIN_HZ <= hz <= IF_OFFSET_MAX_HZ:
+        raise ValueError(f"IF offset {hz} Hz: use 0 (off) or "
+                         f"{IF_OFFSET_MIN_HZ}..{IF_OFFSET_MAX_HZ} Hz")
+    return hz
+
+
+def mode_passband(mode):
+    """(low, high) offsets from the slice that the LO policy keeps clear, and the
+    side the LO goes on (-1 below the slice, +1 above).
+
+    Upper-sideband family (USB, DIGU, CW, anything unknown) -> 0..+3 kHz, LO
+    below; lower family -> -3..0 kHz, LO above. AM/FM -> +/-3 kHz, LO below
+    (either side works; below was picked). The adapter's demod is SSB-only, so
+    +/-3 kHz covers what it actually passes for those modes.
+    """
+    m = (mode or "").upper()
+    if m in LOWER_MODES:
+        return (-SSB_PASS_HZ, 0), +1
+    if m in SYMMETRIC_MODES:
+        return (-SSB_PASS_HZ, SSB_PASS_HZ), -1
+    return (0, SSB_PASS_HZ), -1
+
+
+def lo_clearance(lo, slice_hz, mode):
+    """Hz between the LO and the nearest passband edge; negative if inside it."""
+    (a, b), _ = mode_passband(mode)
+    lo_edge, hi_edge = slice_hz + a, slice_hz + b
+    if lo < lo_edge:
+        return lo_edge - lo
+    if lo > hi_edge:
+        return lo - hi_edge
+    return -min(lo - lo_edge, hi_edge - lo)
+
+
+def lo_ok(lo, center_hz, slice_hz, mode, offset_hz):
+    """True if an LO of `lo` can stay put: in coverage, the passband clear of it
+    by LO_GUARD_HZ and inside its usable window, and the unsampled pan edge no
+    wider than offset + LO_DEAD_EXTRA_HZ."""
+    if lo is None or not in_rx_coverage(lo):
+        return False
+    if lo_clearance(lo, slice_hz, mode) < LO_GUARD_HZ:
+        return False
+    if abs(center_hz - lo) > offset_hz + LO_DEAD_EXTRA_HZ:
+        return False
+    (a, b), _ = mode_passband(mode)
+    return max(abs(slice_hz + a - lo), abs(slice_hz + b - lo)) <= LO_USABLE_HZ
+
+
+def choose_lo(center_hz, slice_hz, mode, cur_lo, offset_hz, relax=False):
+    """The LO to request, or None to keep `cur_lo`.
+
+    offset 0: today's behaviour, LO = pan centre (None if already there).
+    Otherwise, hysteresis: a current LO that lo_ok() accepts is kept, so a slice
+    drag moves the LO only every several kHz. When it must move (or `relax` asks
+    for the preferred LO once the slice has settled) the candidates are, in
+    order: centre on the mode's side, centre on the other side, the centre
+    itself; the first lo_ok() one wins. If none passes, the in-coverage one with
+    the most clearance. If none is in coverage at all, the centre, so the
+    adapter's coverage check refuses it once and says so.
+    """
+    center_hz = float(center_hz)
+    if not offset_hz:
+        if cur_lo is not None and abs(cur_lo - center_hz) <= 1.0:
+            return None
+        return center_hz
+    if not relax and lo_ok(cur_lo, center_hz, slice_hz, mode, offset_hz):
+        return None
+    _, side = mode_passband(mode)
+    cands = (center_hz + side * offset_hz, center_hz - side * offset_hz, center_hz)
+    good = [c for c in cands if lo_ok(c, center_hz, slice_hz, mode, offset_hz)]
+    if good:
+        pick = good[0]
+    else:
+        inside = [c for c in cands if in_rx_coverage(c)]
+        pick = (max(inside, key=lambda c: lo_clearance(c, slice_hz, mode))
+                if inside else center_hz)
+    if cur_lo is not None and abs(pick - cur_lo) <= 1.0:
+        return None
+    return pick

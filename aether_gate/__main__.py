@@ -179,7 +179,9 @@ def build_adapter(name, args):
         station = args.station if args.station != "aether-gate 1" else "FLEX-1500"
         # FLEX-6600 = HF + 6 m, which is what the 1500 covers (RADIO_SUPPORT.md).
         return cls(preamp_db=args.flex1500_preamp, model=args.model,
-                   serial=serial, station=station)
+                   serial=serial, station=station,
+                   dc_block=not args.flex1500_no_dc_block,
+                   if_offset_hz=args.flex1500_if_offset)
     return cls()
 
 
@@ -255,6 +257,14 @@ def main(argv=None):
     # flex1500 adapter options (RX only)
     ap.add_argument("--flex1500-preamp", type=int, default=0, choices=(-10, 0, 10, 20, 30),
                     help="flex1500 adapter: RX preamp, nominal dB (-10/0/10/20/30; default 0)")
+    ap.add_argument("--flex1500-no-dc-block", action="store_true",
+                    help="flex1500 adapter: do not remove the codec's DC offset from the IQ "
+                         "(for A/B; the DC level is still measured and shown in diagnostics)")
+    ap.add_argument("--flex1500-if-offset", type=int, default=10_000, metavar="HZ",
+                    help="flex1500 adapter: keep the hardware LO this far off the slice "
+                         "passband and shift the IQ digitally (0 = off, LO on the pan "
+                         "centre; else 2000-16000; default 10000). Costs HZ of unsampled "
+                         "spectrum at one pan edge, shown as floor")
     ap.add_argument("--serial", default="GATE0001", help="advertised Flex serial (unique per gate; avoids AE chooser collisions)")
     ap.add_argument("--station", default="aether-gate 1", help="station name AE displays (number per dongle: 'aether-gate 1', 'aether-gate 2', ...)")
     ap.add_argument("--enable-tx", action="store_true",
