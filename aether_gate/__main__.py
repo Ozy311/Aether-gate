@@ -173,6 +173,13 @@ def build_adapter(name, args):
         return cls(radio_ip=args.radio_ip, local_ip=args.radio_local_ip,
                    samp_rate=sr, gain_db=int(args.gain),
                    model=model, serial=serial, station=station)
+    if name == "flex1500":
+        # Serial: the radio's own GET_SERIAL_NUM unless the user set one.
+        serial = args.serial if args.serial != "GATE0001" else ""
+        station = args.station if args.station != "aether-gate 1" else "FLEX-1500"
+        # FLEX-6600 = HF + 6 m, which is what the 1500 covers (RADIO_SUPPORT.md).
+        return cls(preamp_db=args.flex1500_preamp, model=args.model,
+                   serial=serial, station=station)
     return cls()
 
 
@@ -245,6 +252,9 @@ def main(argv=None):
     ap.add_argument("--rigctld-bin", default="rigctld", help="kenwood adapter: rigctld executable path (default: on PATH)")
     # yaesu adapter options (same hamlib+soapy plumbing as kenwood; shares --rigctld-*/--rig-*/--soapy-*)
     ap.add_argument("--yaesu-model", default="FT-847", help="yaesu adapter: Yaesu model (FT-847/FT-991A/FTDX10/FT-710/FT-817)")
+    # flex1500 adapter options (RX only)
+    ap.add_argument("--flex1500-preamp", type=int, default=0, choices=(-10, 0, 10, 20, 30),
+                    help="flex1500 adapter: RX preamp, nominal dB (-10/0/10/20/30; default 0)")
     ap.add_argument("--serial", default="GATE0001", help="advertised Flex serial (unique per gate; avoids AE chooser collisions)")
     ap.add_argument("--station", default="aether-gate 1", help="station name AE displays (number per dongle: 'aether-gate 1', 'aether-gate 2', ...)")
     ap.add_argument("--enable-tx", action="store_true",

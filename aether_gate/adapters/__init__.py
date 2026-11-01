@@ -15,6 +15,7 @@ from .icom7300 import Icom7300Adapter   # USB CI-V; pyserial import is deferred/
 from .kenwood import KenwoodAdapter     # hamlib(rigctld TCP) + soapy; imports stdlib-only here
 from .yaesu import YaesuAdapter         # thin subclass of KenwoodAdapter; Yaesu registry + defaults
 from .hpsdr import HpsdrAdapter         # HPSDR Protocol-1 SDR (Radioberry/HL2); numpy import deferred to open()
+from .flex1500 import Flex1500Adapter   # FLEX-1500 over USB, RX only; usb1/numpy imports deferred to open()
 
 _REGISTRY = {
     "sim": SimAdapter,
@@ -24,6 +25,7 @@ _REGISTRY = {
     "kenwood": KenwoodAdapter,
     "yaesu": YaesuAdapter,
     "hpsdr": HpsdrAdapter,
+    "flex1500": Flex1500Adapter,
 }
 
 
@@ -45,5 +47,6 @@ def available():
 
 
 __all__ = ["RadioAdapter", "AdapterCaps", "Meters", "SimAdapter", "SoapyAdapter",
-           "Icom9700Adapter", "Icom7300Adapter", "KenwoodAdapter", "YaesuAdapter", "register",
+           "Icom9700Adapter", "Icom7300Adapter", "KenwoodAdapter", "YaesuAdapter",
+           "Flex1500Adapter", "register",
            "get_adapter", "available"]
