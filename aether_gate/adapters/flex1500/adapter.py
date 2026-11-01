@@ -529,6 +529,13 @@ class Flex1500Adapter(RadioAdapter):
             return
         self._slice_req_hz = slice_hz
         self._slice_hz = slice_hz
+        if self.capabilities.native_centered_scope:
+            # The engine has ALREADY moved AE's pan centre onto the slice when
+            # it calls this (core/engine.py, slice set: native_centered_scope
+            # branch, then _sync_active_slice). Deciding against the stale
+            # centre picked an LO for the old pan, which hysteresis then kept
+            # until the relax retune: two retunes per slice jump (found live).
+            self._ae_center_hz = slice_hz
         self._evaluate_lo()
 
     def set_mode(self, mode):
@@ -589,7 +596,8 @@ class Flex1500Adapter(RadioAdapter):
         st = self._chan.last_status if self._chan else None
         center = self._ae_center_hz
         shift = (self.lo_hz - center) if (self.lo_hz is not None and center is not None) else None
-        dead = dsp.unsampled_band(shift, self.samp_rate) if shift else None
+        # below 0.5 Hz the shift is just tuning-word quantisation: _relabel skips it
+        dead = dsp.unsampled_band(shift, self.samp_rate) if (shift and abs(shift) >= 0.5) else None
         dc = self._dc_counts()
         d = {
             "radio": "FLEX-1500",

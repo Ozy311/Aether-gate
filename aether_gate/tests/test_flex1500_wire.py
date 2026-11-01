@@ -409,6 +409,26 @@ def test_adapter_relaxes_once_after_drag_despite_per_frame_calls():
     print("ok  flex1500: relax fires once after a drag, per-frame calls ignored")
 
 
+def test_adapter_slice_jump_is_one_retune_to_the_preferred_lo():
+    # The engine moves AE's pan centre onto the slice before it calls
+    # set_slice(); the LO decision must use that centre, not the previous one,
+    # or a 12 kHz jump picks an LO 2 kHz under the slice (fine for the OLD pan),
+    # keeps it, and needs a second retune later.
+    # Kills: deciding set_slice() against the stale pan centre.
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    a = Flex1500Adapter(center_hz=38_394_000.0)
+    a._seeded = True
+    a._ae_center_hz = 38_394_000.0
+    a._lo_req = 38_384_000.0
+    a.set_slice(38_394_000.0)
+    a._retune_to, n0 = None, a.retunes_requested
+    a.set_slice(38_406_000.0)                      # engine order: set_slice, then get_iq
+    a.get_iq(1024, 38_406_000.0, 48_000.0)
+    assert a._retune_to == 38_396_000.0, a._retune_to
+    assert a.retunes_requested - n0 == 1, a.retunes_requested - n0
+    print("ok  flex1500: a slice jump is one retune, straight to the preferred LO")
+
+
 # --- offset tuning: wire.choose_lo (stdlib) ------------------------------------
 _V = 14_074_000.0
 
