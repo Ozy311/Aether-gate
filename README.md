@@ -176,6 +176,15 @@ Linux the radio's USB device node is root-owned by default, so either run the ga
 add a udev rule for `2192:1502` yourself; the gate does not install one. Run it with
 `--adapter flex1500` (optionally `--flex1500-preamp -10|0|10|20|30`).
 
+The radio is direct conversion, so its codec DC offset shows as a line at the hardware LO (measured
+~74 dB over the pan median with no antenna). The adapter handles it two ways, both on by default: a slow
+(~1 Hz) DC block on the IQ, and offset tuning, which keeps the LO 10 kHz off the slice (below it for
+USB/CW/digital-upper/AM/FM, above it for LSB/digital-lower) and shifts the IQ back digitally. The cost of
+the offset: the 10 kHz at one edge of the 48 kHz pan were not sampled, and the pan shows that edge as
+floor rather than as aliased signals. `--flex1500-no-dc-block` and `--flex1500-if-offset HZ` (0 = off,
+otherwise 2000-16000) switch them for comparison; the diagnostics page shows the LO, the digital shift,
+the unsampled edge and the DC level measured before removal.
+
 Check what it found: the Setup page's **Known info / status** link lists numpy, SoapySDR, hamlib and any
 dongles it can see.
 

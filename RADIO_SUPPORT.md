@@ -105,7 +105,7 @@ it in the setup web UI). hamlib model ids confirmed on the Pi5 gate's hamlib 202
 |---|---|---|---|---|---|
 | Radioberry | (n/a) | native-iq (HPSDR) | FLEX-6700 | HF(+VHF w/ board) | HPSDR proto or SoapyHPSDR; TX-capable; see HPSDR fork |
 | RTL-SDR / Airspy / SDRplay | (n/a) | native-iq (SoapySDR) | FLEX-6x00 | per device | ✅ soapy adapter exists |
-| FlexRadio FLEX-1500 | USB (libusb) | native-iq, 48 kHz | FLEX-6600 | HF/6m (RX 0.49–54 MHz) | `flex1500` adapter, RX only. Spectrum + tuning verified on one radio (fw 0.5.3.24, no antenna); audio, preamp, unplug not verified |
+| FlexRadio FLEX-1500 | USB (libusb) | native-iq, 48 kHz | FLEX-6600 | HF/6m (RX 0.49–54 MHz) | `flex1500` adapter, RX only. Spectrum, tuning, DC block and offset tuning verified on one radio (fw 0.5.3.24, no antenna); audio measured as levels only (not listened to, no signal), preamp and unplug not verified |
 
 ---
 
