@@ -69,7 +69,7 @@ note above); **no other family keys a radio**.
 | **Icom IC-7300 USB** | USB CI-V + USB Audio CODEC | radio's own scope | ✅ proven RX/control only |
 | **Kenwood / Yaesu / Elecraft / Icom-USB** (CAT) | hamlib (`rigctld`) | SDR dongle, CAT-steered | ✅ proven (Kenwood TS-450S); other hamlib rigs = same path |
 | **SoapySDR dongles** (RTL-SDR, Airspy, SDRplay) | SoapySDR | the dongle itself | ✅ |
-| **FlexRadio FLEX-1500** (USB) | libusb (`libusb1` + numpy) | the radio's own 48 kHz I/Q | RX only; verified on one FLEX-1500 (fw 0.5.3.24), no antenna |
+| **FlexRadio FLEX-1500** (USB) | libusb (`libusb1` + numpy) | the radio's own 48 kHz I/Q | RX only. Spectrum and tuning verified on one FLEX-1500 (fw 0.5.3.24, no antenna); audio, preamp effect and unplug not verified |
 | **sim** | built-in test patterns | synthetic | ✅ (no hardware — for trying it out) |
 
 See [RADIO_SUPPORT.md](RADIO_SUPPORT.md) for the two-axis (control + spectrum) model

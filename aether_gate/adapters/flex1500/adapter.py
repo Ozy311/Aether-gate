@@ -493,9 +493,15 @@ class Flex1500Adapter(RadioAdapter):
                 "tune_ok": self.tune_ok, "tune_refused": self.tune_refused,
                 "tune_failed": self.tune_failed},
             "tx": "not supported by this adapter (RX only)",
-            "known_artifacts": ("38.4 MHz TCXO leaks into RX ~20 dB above the floor; a "
-                                "fixed baseband pair near +/-19.4 kHz is not RF (does not "
-                                "move with the LO)"),
+            # Measured 2026-11-01 (no antenna): the codec's DC offset shows as a
+            # spike at the LO ~70 dB over the pan's median. Not removed here —
+            # the slice sits on the LO, so how to handle it (DC blocker vs
+            # offset tuning) is an open design choice, and the audio path has
+            # not been exercised live.
+            "known_artifacts": ("DC spike at the LO (codec DC offset, ~70 dB over the "
+                                "median, not removed); 38.4 MHz TCXO leaks into RX ~15-20 dB "
+                                "above the floor; a fixed baseband pair near +/-19.4 kHz is "
+                                "not RF (does not move with the LO)"),
         }
         return d
 
