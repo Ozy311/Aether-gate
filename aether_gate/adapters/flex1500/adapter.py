@@ -30,12 +30,14 @@ stuck-PTT watchdog, unkey on disconnect, and what happens when intent is
 ambiguous).
 
 DC and offset tuning. The codec's DC offset shows at the hardware LO (~70 dB
-over the pan's median, measured). Two independent remedies, both on by default
-and each switchable for A/B (--flex1500-no-dc-block, --flex1500-if-offset 0):
-a ~1 Hz block-wise DC block on the raw IQ before the pan and the demod, and
-offset tuning (wire.choose_lo): the LO sits off the slice's passband, the IQ is
-shifted back digitally, and the |shift| Hz edge of the pan the radio did not
-sample is zeroed, not aliased.
+over the pan's median, measured). Two independent remedies, each switchable:
+a ~1 Hz block-wise DC block on the raw IQ before the pan and the demod, ON by
+default (--flex1500-no-dc-block turns it off), and offset tuning
+(wire.choose_lo), OFF by default (--flex1500-if-offset HZ turns it on). With the
+defaults the LO is the slice, AE's pan is centred on it and all 48 kHz are real
+samples. With an offset the LO sits off the slice's passband, the IQ is shifted
+back digitally, and the |shift| Hz edge of the pan the radio did not sample is
+zeroed, not aliased: that dead edge is the price of the opt-in.
 
 §II — what is a reading and what is not. The firmware revision, serial number
 and status byte are replies from the radio. The filter, preamp and LO are
@@ -652,8 +654,8 @@ class Flex1500Adapter(RadioAdapter):
             "tx": "not supported by this adapter (RX only)",
             "known_artifacts": ("codec DC offset at the hardware LO (~70 dB over the "
                                 "median raw, measured 2026-11-01): removed by the DC "
-                                "block and kept out of the slice passband by the IF "
-                                "offset when those are on; with the offset on, "
+                                "block (default on); kept out of the slice passband by "
+                                "the opt-in IF offset; with the offset on, "
                                 "|digital_shift_hz| at one pan edge is unsampled and "
                                 "shown as floor; 38.4 MHz TCXO leaks into RX ~15-20 dB "
                                 "above the floor; a fixed baseband pair near +/-19.4 kHz "

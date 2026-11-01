@@ -375,7 +375,9 @@ class CommandChannel:
 # The codec's DC offset (measured -147 / +55 counts on I / Q with no antenna,
 # ~70 dB over the pan's median) sits exactly at the hardware LO. The engine
 # centres AE's pan on the slice (native_centered_scope), so an LO equal to the
-# pan centre puts every slice on top of it. Offset tuning moves the LO off the
+# pan centre puts every slice on top of it. By default (IF_OFFSET_HZ = 0) that
+# is what happens and the DC block (dsp.DcBlocker) removes the line: the pan is
+# then all real data. Opt-in offset tuning instead moves the LO off the
 # slice's audio passband and the adapter shifts the IQ digitally so the pan
 # stays labelled for the centre AE asked for. Prior art: PowerSDR (GPL, app
 # code console.cs) tuned the FLEX-1500's DDS 3.8 kHz off the dial and shifted
@@ -387,7 +389,7 @@ class CommandChannel:
 # sampled. The adapter zeroes that edge (dsp.mask_unsampled) rather than let the
 # wrapped alias paint signals that are not there.
 
-IF_OFFSET_HZ = 10_000          # default LO offset from the pan centre
+IF_OFFSET_HZ = 0               # default: LO on the slice (opt-in offset: 2000..16000)
 IF_OFFSET_MIN_HZ = 2_000       # 0 = off; otherwise within these bounds
 IF_OFFSET_MAX_HZ = 16_000
 LO_GUARD_HZ = 1_500            # the passband may come no closer to the LO than this

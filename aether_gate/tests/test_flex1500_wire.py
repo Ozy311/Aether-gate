@@ -346,7 +346,7 @@ def test_adapter_asks_once_per_slice_and_centre():
     # Kills: comparing to the hardware LO instead of the last request
     # (found live: 1402 refusals in ~30 s for a slice on 98.68 MHz).
     from aether_gate.adapters.flex1500 import Flex1500Adapter
-    a = Flex1500Adapter(center_hz=14_100_000.0)
+    a = Flex1500Adapter(center_hz=14_100_000.0, if_offset_hz=10_000)   # opt-in offset
     a.set_slice(98_682_540.0)
     assert a._retune_to == 98_682_540.0
     a._retune_to = None
@@ -361,7 +361,7 @@ def test_adapter_asks_once_per_slice_and_centre():
     for _ in range(5):                             # set_mode/get_audio repeat every frame
         a.set_mode("USB")
     assert a._retune_to is None
-    # A new centre is ONE request. With the default 10 kHz IF offset and USB the
+    # A new centre is ONE request. With a 10 kHz IF offset and USB the
     # LO goes 10 kHz below the centre (it was the centre itself before offset
     # tuning, which put the slice on the DC spike).
     a.get_iq(1024, 7_074_000.0, 48_000.0)
@@ -385,7 +385,7 @@ def test_adapter_relaxes_once_after_drag_despite_per_frame_calls():
     # Kills: dropping the input dedupe in _evaluate_lo, or relax never wired.
     import time as _t
     from aether_gate.adapters.flex1500 import Flex1500Adapter
-    a = Flex1500Adapter(center_hz=14_074_000.0)
+    a = Flex1500Adapter(center_hz=14_074_000.0, if_offset_hz=10_000)   # opt-in offset
     a._seeded = True
     a._ae_center_hz = 14_074_000.0
     a._lo_req = 14_064_000.0
@@ -416,7 +416,7 @@ def test_adapter_slice_jump_is_one_retune_to_the_preferred_lo():
     # keeps it, and needs a second retune later.
     # Kills: deciding set_slice() against the stale pan centre.
     from aether_gate.adapters.flex1500 import Flex1500Adapter
-    a = Flex1500Adapter(center_hz=38_394_000.0)
+    a = Flex1500Adapter(center_hz=38_394_000.0, if_offset_hz=10_000)   # opt-in offset
     a._seeded = True
     a._ae_center_hz = 38_394_000.0
     a._lo_req = 38_384_000.0
@@ -546,6 +546,25 @@ def test_cli_switches_reach_the_adapter():
     assert "dc_block=not args.flex1500_no_dc_block" in src
     assert "if_offset_hz=args.flex1500_if_offset" in src
     print("ok  flex1500: --flex1500-no-dc-block / --flex1500-if-offset wired")
+
+
+def test_defaults_lo_on_slice_and_dc_block_on():
+    # Ozy, 2026-11-01: IF offset 0 (LO = slice, pan centred on the slice, all
+    # 48 kHz real data) and the DC block on, in the adapter and the CLI.
+    # Kills: either default flipped back (offset 10000, or DC block off), or the
+    # CLI default drifting from the adapter's.
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    from aether_gate import __main__ as m
+    a = Flex1500Adapter()
+    assert a.if_offset_hz == 0 and w.IF_OFFSET_HZ == 0, a.if_offset_hz
+    assert a.dc_block is True
+    src = open(m.__file__, encoding="utf-8").read()
+    assert '"--flex1500-if-offset", type=int, default=0,' in src
+    assert '"--flex1500-no-dc-block", action="store_true"' in src
+    # offset 0: the LO is the pan centre, i.e. the slice (native-centred)
+    a.set_slice(7_066_600.0)
+    assert a._retune_to == 7_066_600.0, a._retune_to
+    print("ok  flex1500: defaults are IF offset 0 and DC block on")
 
 
 def main():

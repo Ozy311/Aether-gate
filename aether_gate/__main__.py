@@ -260,11 +260,13 @@ def main(argv=None):
     ap.add_argument("--flex1500-no-dc-block", action="store_true",
                     help="flex1500 adapter: do not remove the codec's DC offset from the IQ "
                          "(for A/B; the DC level is still measured and shown in diagnostics)")
-    ap.add_argument("--flex1500-if-offset", type=int, default=10_000, metavar="HZ",
-                    help="flex1500 adapter: keep the hardware LO this far off the slice "
-                         "passband and shift the IQ digitally (0 = off, LO on the pan "
-                         "centre; else 2000-16000; default 10000). Costs HZ of unsampled "
-                         "spectrum at one pan edge, shown as floor")
+    ap.add_argument("--flex1500-if-offset", type=int, default=0, metavar="HZ",
+                    help="flex1500 adapter: opt-in offset tuning. 0 (default) puts the LO on "
+                         "the slice: the pan is centred on the slice, all 48 kHz are real "
+                         "data and the DC block removes the codec's DC line. 2000-16000 keeps "
+                         "the LO that far off the slice passband and shifts the IQ digitally; "
+                         "the pan stays centred on the slice, so HZ of spectrum at one pan "
+                         "edge is unsampled and shown as floor")
     ap.add_argument("--serial", default="GATE0001", help="advertised Flex serial (unique per gate; avoids AE chooser collisions)")
     ap.add_argument("--station", default="aether-gate 1", help="station name AE displays (number per dongle: 'aether-gate 1', 'aether-gate 2', ...)")
     ap.add_argument("--enable-tx", action="store_true",
