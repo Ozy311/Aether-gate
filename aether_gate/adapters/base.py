@@ -157,24 +157,6 @@ class RadioAdapter(ABC):
         """The source's current mode string (USB/FM/...), or None."""
         return None
 
-    def scope_center_hz(self, slice_hz: float, mode: str):
-        """OPTIONAL. Where this source's scope is centred (Hz) when a slice sits
-        at `slice_hz` in `mode`, or None to let the engine frame the pan on the
-        slice as it always has.
-
-        For a source whose pixels are not centred on the slice: a
-        direct-conversion radio that offsets its LO from the slice to keep its
-        DC line out of the passband (flex1500) returns that LO, so AE's pan is
-        centred on the frequencies the radio really sampled and the slice is
-        drawn off-centre. When it returns a number the engine uses it wherever
-        it frames a pan on a slice (slice create, slice tune/mode change, pan
-        lock) and, when AE moves the pan, keeps the slice at that offset from
-        the new centre. The engine treats None, a raise, or a value outside its
-        tune envelope as absent. Default: None, so adapters that do not
-        override it behave exactly as before.
-        """
-        return None
-
     # --- readback (radio -> AE) -----------------------------------------
     def read_meters(self) -> Meters:
         """Optional S-meter / TX state. Default: quiet RX."""

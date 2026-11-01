@@ -1355,10 +1355,7 @@ class Radio:
             for s in self.slices.values(): s["active"] = False
             self.slices[idx] = {"freq": freq, "mode": mode, "active": True, "pan": pid}
             self.pans[pid]["slice"] = idx
-            # The pan frames on its slice at creation, or where the adapter's
-            # scope_center_hz() hook says its scope is centred for that slice.
-            hooked = self._scope_center_mhz(freq, mode)
-            self.pans[pid]["center"] = freq if hooked is None else hooked
+            self.pans[pid]["center"] = freq                # pan frames on its slice at creation
             self.active_slice = idx
             self._sync_active_slice()                      # mirror active slice -> slice_freq/mode + pan centre
             self.reply(conn, seq, str(idx))
@@ -1437,8 +1434,7 @@ class Radio:
                     pan["center"] = new_center
                     sidx = pan.get("slice")
                     if sidx is not None and sidx in self.slices:
-                        self.slices[sidx]["freq"] = self._slice_for_pan_center(
-                            self.slices[sidx], new_center)
+                        self.slices[sidx]["freq"] = new_center
                 else:
                     self.center_mhz = new_center           # no pan id: legacy radio-global behaviour
                 self._sync_active_slice()
@@ -1676,31 +1672,17 @@ class Radio:
                 for s in self.slices.values(): s["active"] = False
                 sl["active"] = True
                 self.active_slice = idx
-            # Where the adapter says its scope is centred for this slice (the
-            # optional scope_center_hz() hook), or None: frame on the slice.
-            # Mode was applied above, so a mode change that moves the scope
-            # centre (e.g. an offset LO changing sides) re-centres too.
-            hooked = self._scope_center_mhz(sl["freq"], sl.get("mode"))
             if kvs.get("autopan") == "1":                  # Pan Lock on: the pan re-centres on the slice
                 pid = sl.get("pan")
-                if pid in self.pans:
-                    self.pans[pid]["center"] = sl["freq"] if hooked is None else hooked
+                if pid in self.pans: self.pans[pid]["center"] = sl["freq"]
             elif self._adapter_native_centered_scope():
                 # A native rig scope is physically centered on the receiver we
                 # just tuned. Keeping AE's pan center elsewhere makes the
                 # waterfall frequency ruler disagree with the pixels.
                 pid = sl.get("pan")
-                if hooked is None:
-                    if pid in self.pans and self.pans[pid].get("center") != sl["freq"]:
-                        self.pans[pid]["center"] = sl["freq"]
-                        pan_center_changed = True
-                elif pid in self.pans:
-                    # 1 Hz tolerance: the hook works in Hz and the pan in MHz, so
-                    # an exact compare would re-send pan status on every tune.
-                    cur = self.pans[pid].get("center")
-                    if cur is None or abs(cur - hooked) > 1e-6:
-                        self.pans[pid]["center"] = hooked
-                        pan_center_changed = True
+                if pid in self.pans and self.pans[pid].get("center") != sl["freq"]:
+                    self.pans[pid]["center"] = sl["freq"]
+                    pan_center_changed = True
             self.reply(conn, seq)
             # SUB-slice tune goes DIRECTLY to the 2nd receiver, regardless of
             # which slice is active (a slice-1 tune while slice 0 is active
@@ -1814,57 +1796,6 @@ class Radio:
     def _adapter_native_centered_scope(self):
         caps = getattr(getattr(self, "adapter", None), "capabilities", None)
         return bool(getattr(caps, "native_centered_scope", False))
-
-    def _scope_center_mhz(self, slice_mhz, mode):
-        """The pan centre (MHz) the adapter's optional scope_center_hz() hook
-        gives for a slice at `slice_mhz` in `mode`, or None.
-
-        None means "frame the pan on the slice, as before": the adapter has no
-        hook (every adapter but the ones that opt in), the hook declined, it
-        raised, or it returned something that is not a tunable frequency. Each
-        caller keeps its old behaviour on None, so an adapter without the hook
-        sees no change at all (adapters/base.py, RadioAdapter.scope_center_hz).
-        """
-        fn = getattr(getattr(self, "adapter", None), "scope_center_hz", None)
-        if fn is None:
-            return None
-        try:
-            hz = fn(float(slice_mhz) * 1e6, mode)
-        except Exception as e:
-            log("[adapter] scope_center_hz error:", e)
-            return None
-        if hz is None:
-            return None
-        try:
-            mhz = float(hz) / 1e6
-        except (TypeError, ValueError):
-            return None
-        if not (TUNE_MIN_MHZ <= mhz <= TUNE_MAX_MHZ):  # also rejects NaN
-            return None
-        return mhz
-
-    def _slice_for_pan_center(self, sl, center_mhz):
-        """Where a pan's slice goes when AE moves the pan to `center_mhz`
-        (`display pan set center=`/`band=`).
-
-        Without the hook: onto the new centre, as before. With it, the slice
-        keeps the offset the hook puts between a slice and its pan centre, so
-        the pan stays exactly where AE asked (never echo a different centre
-        mid-drag) and the adapter's LO stays on it. For a fixed offset this is
-        the hook's inverse: hook(slice) == center.
-
-        A request to centre on the slice itself (AE's centre lock sends
-        center=<slice freq> after every slice move) leaves the slice alone:
-        mapping it would move the slice, AE would snap again, and the slice
-        would walk one offset per round trip.
-        """
-        hooked = self._scope_center_mhz(center_mhz, sl.get("mode"))
-        if hooked is None:
-            return center_mhz
-        if abs(center_mhz - sl["freq"]) <= 1e-6:
-            return sl["freq"]
-        return self._valid_tune_mhz(center_mhz + (center_mhz - hooked), center_mhz,
-                                    "slice for pan centre")
 
     def _set_pan_span_hz(self, span_hz):
         self.span_mhz = max(0.001, float(span_hz) / 1e6)
