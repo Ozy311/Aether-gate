@@ -52,7 +52,7 @@ radio chooser with a live panadapter and waterfall.
 > TX button.
 >
 > **Every other family — hamlib/CAT (Kenwood, Yaesu), the IC-7300 USB path, SoapySDR
-> dongles, HPSDR, `sim` — does not key the radio.** AE's UI may still light up as if
+> dongles, HPSDR, the FLEX-1500, `sim` — does not key the radio.** AE's UI may still light up as if
 > transmitting, but **no RF is produced**: the gate acknowledges the transmit command and
 > reports "transmitting" back to AE without ever asserting PTT. See
 > *[How it works](#how-it-works)* for the detail.
@@ -69,6 +69,7 @@ note above); **no other family keys a radio**.
 | **Icom IC-7300 USB** | USB CI-V + USB Audio CODEC | radio's own scope | ✅ proven RX/control only |
 | **Kenwood / Yaesu / Elecraft / Icom-USB** (CAT) | hamlib (`rigctld`) | SDR dongle, CAT-steered | ✅ proven (Kenwood TS-450S); other hamlib rigs = same path |
 | **SoapySDR dongles** (RTL-SDR, Airspy, SDRplay) | SoapySDR | the dongle itself | ✅ |
+| **FlexRadio FLEX-1500** (USB) | libusb (`libusb1` + numpy) | the radio's own 48 kHz I/Q | RX only; verified on one FLEX-1500 (fw 0.5.3.24), no antenna |
 | **sim** | built-in test patterns | synthetic | ✅ (no hardware — for trying it out) |
 
 See [RADIO_SUPPORT.md](RADIO_SUPPORT.md) for the two-axis (control + spectrum) model
@@ -168,6 +169,12 @@ python3 -m venv --system-site-packages ~/.aether-gate
 ```
 
 `--system-site-packages` matters: without it the environment cannot see Homebrew's numpy or SoapySDR either.
+
+**A FLEX-1500?** The `flex1500` adapter talks to the radio over USB with the **libusb1** Python package
+(LGPL-2.1+) and numpy: `pip install libusb1 numpy`, plus the libusb-1.0 library. It is receive only. On
+Linux the radio's USB device node is root-owned by default, so either run the gate with access to it or
+add a udev rule for `2192:1502` yourself; the gate does not install one. Run it with
+`--adapter flex1500` (optionally `--flex1500-preamp -10|0|10|20|30`).
 
 Check what it found: the Setup page's **Known info / status** link lists numpy, SoapySDR, hamlib and any
 dongles it can see.
