@@ -177,13 +177,25 @@ add a udev rule for `2192:1502` yourself; the gate does not install one. Run it 
 `--adapter flex1500` (optionally `--flex1500-preamp -10|0|10|20|30`).
 
 The radio is direct conversion, so its codec DC offset shows as a line at the hardware LO (measured
-~74 dB over the pan median with no antenna). The adapter handles it two ways, both on by default: a slow
-(~1 Hz) DC block on the IQ, and offset tuning, which keeps the LO 10 kHz off the slice (below it for
-USB/CW/digital-upper/AM/FM, above it for LSB/digital-lower) and shifts the IQ back digitally. The cost of
-the offset: the 10 kHz at one edge of the 48 kHz pan were not sampled, and the pan shows that edge as
-floor rather than as aliased signals. `--flex1500-no-dc-block` and `--flex1500-if-offset HZ` (0 = off,
-otherwise 2000-16000) switch them for comparison; the diagnostics page shows the LO, the digital shift,
-the unsampled edge and the DC level measured before removal.
+~74 dB over the pan median with no antenna). By default the LO sits on the slice, AE's pan is centred on
+the slice and all 48 kHz of it are real data, and a slow (~1 Hz) DC block on the IQ removes the line (with
+it on, no spike was visible at 7.0666 MHz in AE). The DC block's price: a carrier within about a hertz of
+the slice is taken out with the line (measured: 0.5 Hz off -7 dB, 1 Hz -3.5 dB, 3 Hz -0.9 dB, exactly on
+the LO gone), which matters only for an AM carrier or a CW signal tuned to exact zero beat.
+`--flex1500-no-dc-block` turns it off. `--flex1500-if-offset HZ` (2000-16000) is the opt-in alternative:
+the LO sits that far off the slice (below it for USB/CW/digital-upper/AM/FM, above for LSB/digital-lower)
+and the IQ is shifted back digitally. Since the pan stays centred on the slice, its cost is HZ of spectrum
+at one edge of the pan that the radio did not sample, shown as floor rather than as aliased signals. The
+diagnostics page shows the LO, any digital shift, the unsampled edge and the DC level measured before
+removal.
+
+The demodulator follows the mode: USB and digital-upper pass 100 (digital 150) Hz to that plus the width
+above the carrier, LSB and digital-lower the mirror below, CW the carrier +/- half the width heard at a
+600 Hz pitch, AM an envelope detector and FM a discriminator, both over the carrier +/- half the width.
+Default widths are SSB 2.7 kHz, digital 2.85 kHz, CW 500 Hz, AM 6 kHz and FM 16 kHz, and changing mode
+brings that mode's default. A width the engine forwards from AE (`slice set ... filter_low/filter_high`)
+narrows or widens the filter, but AE sends its filter drags and presets as `filt`, which the gate does
+not handle yet, so for now the width comes from the mode. The S-meter measures the same passband.
 
 Check what it found: the Setup page's **Known info / status** link lists numpy, SoapySDR, hamlib and any
 dongles it can see.
