@@ -139,17 +139,20 @@ def test_cw_narrow_filter_rejects_a_signal_600hz_away():
 
 # --- AM ----------------------------------------------------------------------
 
-def _am(fc, m=0.5, fmod=1000.0, amp=0.01, n=N_IQ * BLOCKS):
+def _am(fc, m=0.5, fmod=1000.0, amp=0.01, phase=1.3, n=N_IQ * BLOCKS):
+    # carrier phase 1.3 rad: a real-part (product) detector sees cos(1.3) = 0.27
+    # of the envelope, an envelope detector all of it
     k = np.arange(n)
     env = 1.0 + m * np.cos(2 * np.pi * fmod * k / FS)
-    return (amp * env * np.exp(2j * np.pi * fc * k / FS)).astype(np.complex64)
+    return (amp * env * np.exp(1j * (2 * np.pi * fc * k / FS + phase))).astype(np.complex64)
 
 
 def test_am_envelope_recovers_1khz_and_removes_the_carrier():
     """An AM carrier on the slice, 50 % modulated at 1 kHz: the audio is the
     1 kHz tone at amp*m (the envelope), with the carrier's DC removed, and the
     same signal 6 kHz off the slice (outside +/-3 kHz) is >= 20 dB down.
-    Kills: AM through the SSB product detector (real part), or no DC removal."""
+    Kills: AM through the SSB product detector (real part: carrier phase
+    1.3 rad leaves 27 % of the envelope), or no DC removal."""
     a = _adapter("AM")
     y = _run(a, _am(0.0))
     assert abs(_peak_audio_hz(y) - 1000.0) <= 10.0, _peak_audio_hz(y)
@@ -177,7 +180,7 @@ def test_fm_discriminator_recovers_1khz_deviation_tone():
     """NBFM, 2.5 kHz deviation at 1 kHz: the audio is the 1 kHz tone at the
     discriminator's scale (2*dev/fs_audio = 0.208, soapy's divide-by-pi).
     Kills: FM through the SSB detector, or a discriminator that loses the
-    previous sample across blocks."""
+    previous sample across blocks (a tick every block)."""
     y = _run(_adapter("FM"), _fm(0.0) + _noise(1e-4, 1))
     assert abs(_peak_audio_hz(y) - 1000.0) <= 10.0, _peak_audio_hz(y)
     amp = _amp_at(y, 1000.0)
@@ -187,6 +190,9 @@ def test_fm_discriminator_recovers_1khz_deviation_tone():
     c = 2.0 * np.mean(y * np.conj(ph))                # fitted 1 kHz phasor
     resid = y - np.real(c * ph)
     assert _rms(resid) < 0.1 * _rms(y), (_rms(resid), _rms(y))   # it IS the tone
+    # no tick at the 128-sample block boundaries (a discriminator that forgets
+    # the previous block's last sample outputs 0 there: a spike up to 0.2)
+    assert np.max(np.abs(resid)) < 0.03, np.max(np.abs(resid))
 
 
 def test_fm_rejects_a_signal_outside_the_channel():
