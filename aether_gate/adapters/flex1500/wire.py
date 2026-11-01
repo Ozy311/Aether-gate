@@ -373,21 +373,29 @@ class CommandChannel:
 # --- offset tuning: where the hardware LO goes (pure, stdlib) -------------------
 #
 # The codec's DC offset (measured -147 / +55 counts on I / Q with no antenna,
-# ~70 dB over the pan's median) sits exactly at the hardware LO. The engine
-# centres AE's pan on the slice (native_centered_scope), so an LO equal to the
-# pan centre puts every slice on top of it. Offset tuning moves the LO off the
-# slice's audio passband and the adapter shifts the IQ digitally so the pan
-# stays labelled for the centre AE asked for. Prior art: PowerSDR (GPL, app
-# code console.cs) tuned the FLEX-1500's DDS 3.8 kHz off the dial and shifted
-# digitally, so the DC line stayed visible but outside the passband. This is
-# our own implementation of that idea, not a copy.
+# ~70 dB over the pan's median) sits exactly at the hardware LO, so an LO on
+# the slice puts every slice on top of it. Offset tuning moves the LO off the
+# slice's audio passband. Prior art: PowerSDR (GPL, app code console.cs) tuned
+# the FLEX-1500's DDS 3.8 kHz off the dial, so the DC line stayed visible but
+# outside the passband and the dial sat off the display centre. This is our own
+# implementation of that idea, not a copy.
 #
-# The cost is honest and fixed: the radio samples LO +/- 24 kHz, the pan is
-# centre +/- 24 kHz, so |LO - centre| Hz at one edge of the pan were never
-# sampled. The adapter zeroes that edge (dsp.mask_unsampled) rather than let the
-# wrapped alias paint signals that are not there.
+# Where AE's pan goes: preferred_lo() is the LO for a slice, and the adapter's
+# scope_center_hz() hands it to the engine, which centres AE's pan on it. The
+# pan then shows exactly the 48 kHz the radio sampled, the slice is drawn
+# |offset| off centre, and the DC line sits at the pan centre outside the
+# passband. choose_lo() therefore prefers the pan centre itself whenever it is a
+# clean LO.
+#
+# When the pan centre and the LO differ anyway (hysteresis keeping the LO during
+# a drag, AE momentarily asking for another centre, or no clean LO at all) the
+# adapter shifts the IQ digitally so the pan stays labelled for the centre AE
+# asked for. The radio samples LO +/- 24 kHz and the pan is centre +/- 24 kHz,
+# so |LO - centre| Hz at one edge were never sampled; the adapter zeroes that
+# edge (dsp.mask_unsampled) rather than let the wrapped alias paint signals that
+# are not there.
 
-IF_OFFSET_HZ = 10_000          # default LO offset from the pan centre
+IF_OFFSET_HZ = 10_000          # default LO offset from the slice
 IF_OFFSET_MIN_HZ = 2_000       # 0 = off; otherwise within these bounds
 IF_OFFSET_MAX_HZ = 16_000
 LO_GUARD_HZ = 1_500            # the passband may come no closer to the LO than this
@@ -450,6 +458,25 @@ def lo_ok(lo, center_hz, slice_hz, mode, offset_hz):
     return max(abs(slice_hz + a - lo), abs(slice_hz + b - lo)) <= LO_USABLE_HZ
 
 
+def preferred_lo(slice_hz, mode, offset_hz):
+    """The LO for a slice, and so the centre of AE's pan (scope_center_hz).
+
+    offset 0: the slice (legacy framing, LO on the slice). Otherwise the slice
+    offset to the mode's side, else to the other side (a coverage edge), taking
+    the first that lo_ok() accepts as a pan centre; if neither does (AM/FM with
+    an offset too small to clear +/-3 kHz plus the guard, or out of coverage),
+    the slice, and choose_lo() and the digital shift handle it as before.
+    """
+    slice_hz = float(slice_hz)
+    if not offset_hz:
+        return slice_hz
+    _, side = mode_passband(mode)
+    for c in (slice_hz + side * offset_hz, slice_hz - side * offset_hz):
+        if lo_ok(c, c, slice_hz, mode, offset_hz):
+            return c
+    return slice_hz
+
+
 def choose_lo(center_hz, slice_hz, mode, cur_lo, offset_hz, relax=False):
     """The LO to request, or None to keep `cur_lo`.
 
@@ -457,10 +484,13 @@ def choose_lo(center_hz, slice_hz, mode, cur_lo, offset_hz, relax=False):
     Otherwise, hysteresis: a current LO that lo_ok() accepts is kept, so a slice
     drag moves the LO only every several kHz. When it must move (or `relax` asks
     for the preferred LO once the slice has settled) the candidates are, in
-    order: centre on the mode's side, centre on the other side, the centre
-    itself; the first lo_ok() one wins. If none passes, the in-coverage one with
-    the most clearance. If none is in coverage at all, the centre, so the
-    adapter's coverage check refuses it once and says so.
+    order: the centre itself (no digital shift, no unsampled edge: the engine
+    centres the pan on preferred_lo(), so normally this wins), centre on the
+    mode's side, centre on the other side; the first lo_ok() one wins. A centre
+    on the slice never passes (the passband would sit on the DC line). If none
+    passes, the in-coverage one with the most clearance. If none is in coverage
+    at all, the centre, so the adapter's coverage check refuses it once and says
+    so.
     """
     center_hz = float(center_hz)
     if not offset_hz:
@@ -470,7 +500,7 @@ def choose_lo(center_hz, slice_hz, mode, cur_lo, offset_hz, relax=False):
     if not relax and lo_ok(cur_lo, center_hz, slice_hz, mode, offset_hz):
         return None
     _, side = mode_passband(mode)
-    cands = (center_hz + side * offset_hz, center_hz - side * offset_hz, center_hz)
+    cands = (center_hz, center_hz + side * offset_hz, center_hz - side * offset_hz)
     good = [c for c in cands if lo_ok(c, center_hz, slice_hz, mode, offset_hz)]
     if good:
         pick = good[0]

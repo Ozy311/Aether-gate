@@ -385,17 +385,19 @@ def test_adapter_relaxes_once_after_drag_despite_per_frame_calls():
     # Kills: dropping the input dedupe in _evaluate_lo, or relax never wired.
     import time as _t
     from aether_gate.adapters.flex1500 import Flex1500Adapter
+    # Engine order since scope_center_hz(): the pan centre is the hook's LO
+    # (slice - 10 kHz for USB) and set_slice() runs before the next get_iq().
     a = Flex1500Adapter(center_hz=14_074_000.0)
     a._seeded = True
-    a._ae_center_hz = 14_074_000.0
+    a._ae_center_hz = 14_064_000.0
     a._lo_req = 14_064_000.0
     a.set_slice(14_074_000.0)
-    a.get_iq(1024, 14_079_000.0, 48_000.0)         # drag 5 kHz: hysteresis keeps the LO
-    a.set_slice(14_079_000.0)
+    a.set_slice(14_079_000.0)                      # drag 5 kHz: hysteresis keeps the LO
+    a.get_iq(1024, 14_069_000.0, 48_000.0)
     assert a._retune_to is None and a._lo_req == 14_064_000.0
     t0 = a._lo_changed_at
     for _ in range(50):                            # per-frame calls, same inputs
-        a.get_iq(1024, 14_079_000.0, 48_000.0)
+        a.get_iq(1024, 14_069_000.0, 48_000.0)
         a.set_slice(14_079_000.0)
         a.set_mode("USB")
     assert a._lo_changed_at == t0, "per-frame calls reset the relax timer"
@@ -410,20 +412,20 @@ def test_adapter_relaxes_once_after_drag_despite_per_frame_calls():
 
 
 def test_adapter_slice_jump_is_one_retune_to_the_preferred_lo():
-    # The engine moves AE's pan centre onto the slice before it calls
-    # set_slice(); the LO decision must use that centre, not the previous one,
-    # or a 12 kHz jump picks an LO 2 kHz under the slice (fine for the OLD pan),
-    # keeps it, and needs a second retune later.
+    # The engine moves AE's pan centre to scope_center_hz(slice) before it
+    # calls set_slice(); the LO decision must use that centre, not the previous
+    # one, or a 12 kHz jump keeps an LO fine for the OLD pan and needs a second
+    # retune later.
     # Kills: deciding set_slice() against the stale pan centre.
     from aether_gate.adapters.flex1500 import Flex1500Adapter
     a = Flex1500Adapter(center_hz=38_394_000.0)
     a._seeded = True
-    a._ae_center_hz = 38_394_000.0
+    a._ae_center_hz = 38_384_000.0
     a._lo_req = 38_384_000.0
     a.set_slice(38_394_000.0)
     a._retune_to, n0 = None, a.retunes_requested
     a.set_slice(38_406_000.0)                      # engine order: set_slice, then get_iq
-    a.get_iq(1024, 38_406_000.0, 48_000.0)
+    a.get_iq(1024, a.scope_center_hz(38_406_000.0, "USB"), 48_000.0)
     assert a._retune_to == 38_396_000.0, a._retune_to
     assert a.retunes_requested - n0 == 1, a.retunes_requested - n0
     print("ok  flex1500: a slice jump is one retune, straight to the preferred LO")
@@ -546,6 +548,124 @@ def test_cli_switches_reach_the_adapter():
     assert "dc_block=not args.flex1500_no_dc_block" in src
     assert "if_offset_hz=args.flex1500_if_offset" in src
     print("ok  flex1500: --flex1500-no-dc-block / --flex1500-if-offset wired")
+
+
+# --- scope_center_hz(): the pan is centred on the LO (no dead edge) ------------
+_MODES = ("USB", "DIGU", "CW", "LSB", "DIGL", "CWL", "AM", "FM", "")
+_OFFSETS = (2_000, 5_000, 10_000, 16_000)
+_SLICES = (495_000.0, 1_840_000.0, 7_074_000.0, 14_074_000.0, 38_394_000.0,
+           38_406_000.0, 53_995_000.0)
+
+
+def test_scope_center_side_per_mode_and_offset_zero():
+    # The pan centre is the LO: 10 kHz below the slice for USB/CW/AM/FM, above it
+    # for LSB/DIGL/CWL; with the offset off it is the slice (legacy framing).
+    # Kills: hook returning the slice (dead edge back), the side flipped, or an
+    # offset applied with --flex1500-if-offset 0.
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    a = Flex1500Adapter()
+    for mode, want in (("USB", _V - 10_000), ("CW", _V - 10_000), ("AM", _V - 10_000),
+                       ("FM", _V - 10_000), ("LSB", _V + 10_000), ("DIGL", _V + 10_000)):
+        assert a.scope_center_hz(_V, mode) == want, (mode, a.scope_center_hz(_V, mode))
+    b = Flex1500Adapter(if_offset_hz=0)
+    for mode in _MODES:
+        assert b.scope_center_hz(_V, mode) == _V, mode
+    assert w.preferred_lo(_V, "USB", 0) == _V
+    print("ok  flex1500: scope centre = LO per mode side; offset 0 -> the slice")
+
+
+def test_scope_center_round_trips_through_choose_lo():
+    # Whatever the hook says the pan centre is, the LO policy must pick exactly
+    # that centre and then keep it (also on relax), or the IQ is shifted and an
+    # edge of the pan is unsampled again.
+    # Kills: choose_lo not preferring a clean centre (at 5 kHz the old order
+    # picked centre - 5 kHz = slice - 10 kHz), or relax drifting off it.
+    checked = 0
+    for off in _OFFSETS:
+        for mode in _MODES:
+            for f in _SLICES:
+                c = w.preferred_lo(f, mode, off)
+                if c == f:                         # no clean LO: slice-centred fallback
+                    continue
+                assert w.lo_ok(c, c, f, mode, off), (off, mode, f, c)
+                assert w.choose_lo(c, f, mode, None, off) == c, (off, mode, f, c)
+                assert w.choose_lo(c, f, mode, c, off) is None, (off, mode, f, c)
+                assert w.choose_lo(c, f, mode, c, off, relax=True) is None, (off, mode, f, c)
+                checked += 1
+    assert checked > 200, checked
+    print(f"ok  flex1500: scope centre == chosen LO in {checked} mode/offset/slice cases")
+
+
+def test_choose_lo_prefers_a_clean_centre():
+    # Pan centred 5 kHz under a USB slice with a 5 kHz offset: the centre is a
+    # clean LO, so no digital shift. (Before, the candidates were centre +/-
+    # offset only, which put the LO 10 kHz under the slice and zeroed 5 kHz.)
+    # Kills: the centre candidate dropped or moved behind the offset ones.
+    assert w.choose_lo(_V - 5_000, _V, "USB", None, 5_000) == _V - 5_000
+    assert w.choose_lo(_V + 5_000, _V, "LSB", None, 5_000) == _V + 5_000
+    # a centre ON the slice is still never the LO (the DC line in the passband)
+    assert w.choose_lo(_V, _V, "USB", None, 5_000) == _V - 5_000
+    print("ok  flex1500: a clean pan centre is the LO (no shift, no dead edge)")
+
+
+def test_scope_center_falls_back_to_slice_without_a_clean_lo():
+    # AM/FM pass +/-3 kHz and need 1.5 kHz of guard, so a 2 kHz offset has no
+    # clean LO: frame on the slice as before (the shift path and honest zeroing
+    # still apply). At the coverage edge the LO goes on the other side.
+    # Kills: returning an LO inside the passband, or one out of coverage.
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    a = Flex1500Adapter(if_offset_hz=2_000)
+    assert a.scope_center_hz(_V, "AM") == _V
+    assert a.scope_center_hz(_V, "USB") == _V - 2_000
+    b = Flex1500Adapter()
+    assert b.scope_center_hz(495_000.0, "USB") == 505_000.0
+    assert b.scope_center_hz(53_995_000.0, "LSB") == 53_985_000.0
+    assert b.scope_center_hz(98_682_540.0, "USB") == 98_682_540.0
+    print("ok  flex1500: no clean LO -> slice-centred; coverage edge -> other side")
+
+
+def _drag_hooked(start, stop, step, mode, offset=10_000):
+    """Drag a slice with the engine's new framing (pan centre = the hook's LO),
+    applying every LO the policy asks for. Returns (requests, min_clear)."""
+    lo = w.choose_lo(w.preferred_lo(start, mode, offset), start, mode, None, offset)
+    n, f, worst = 0, start, 1e9
+    while (stop - f) * step > 0:
+        f += step
+        new = w.choose_lo(w.preferred_lo(f, mode, offset), f, mode, lo, offset)
+        if new is not None:
+            lo, n = new, n + 1
+        worst = min(worst, w.lo_clearance(lo, f, mode))
+    return n, worst
+
+
+def test_lo_hysteresis_on_drag_with_scope_centre():
+    # With the pan following the LO the drag must still not retune every step.
+    # Kills: hysteresis lost under the new framing (a request per 10 Hz step).
+    n_up, w_up = _drag_hooked(_V, _V + 50_000, 10.0, "USB")
+    n_dn, w_dn = _drag_hooked(_V, _V - 50_000, -10.0, "USB")
+    n_lsb, w_lsb = _drag_hooked(_V, _V + 50_000, 10.0, "LSB")
+    assert 1 <= n_up <= 9 and 1 <= n_dn <= 9 and 1 <= n_lsb <= 9, (n_up, n_dn, n_lsb)
+    assert min(w_up, w_dn, w_lsb) >= w.LO_GUARD_HZ, (w_up, w_dn, w_lsb)
+    print(f"ok  flex1500: drag 50 kHz (pan on LO) -> {n_up}/{n_dn}/{n_lsb} LO moves")
+
+
+def test_adapter_slice_and_mode_follow_the_scope_centre():
+    # set_slice()/set_mode() must decide against the centre the engine now
+    # gives AE (the hook), so a tune or a side flip is ONE retune to the pan
+    # centre and get_iq() at that centre has nothing to shift.
+    # Kills: set_slice() still assuming pan centre == slice, or set_mode()
+    # deciding a side flip against the old side's centre.
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    a = Flex1500Adapter(center_hz=38_394_000.0)
+    a._seeded = True
+    a.set_slice(38_394_000.0)
+    assert a._ae_center_hz == 38_384_000.0 and a._lo_req == 38_384_000.0
+    a.set_mode("LSB")
+    assert a._ae_center_hz == 38_404_000.0 and a._lo_req == 38_404_000.0, a._lo_req
+    a._retune_to, n0 = None, a.retunes_requested
+    a.get_iq(1024, 38_404_000.0, 48_000.0)         # engine's pan centre after the flip
+    assert a._retune_to is None and a.retunes_requested == n0
+    print("ok  flex1500: set_slice/set_mode decide against the scope centre")
 
 
 def main():
