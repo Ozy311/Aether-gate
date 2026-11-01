@@ -105,7 +105,7 @@ def test_nco_shift_phase_continuous_across_blocks():
     """Shifting two adjacent blocks separately (with their sample indices) must
     equal shifting them joined. Kills: the NCO restarting each block (index 0)."""
     x = _tone(1234.0, 2 * BLK)
-    sh = -9_937.5            # not a whole number of cycles per block (a real
+    sh = -9_937.3            # not a whole number of cycles per block (a real
                              # shift is LO-quantised, never round)
     whole = dsp.nco_shift(x, sh, 5000, FS, np)
     parts = np.concatenate([dsp.nco_shift(x[:BLK], sh, 5000, FS, np),
