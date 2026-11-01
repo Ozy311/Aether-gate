@@ -378,6 +378,37 @@ def test_adapter_asks_once_per_slice_and_centre():
     print("ok  flex1500: one retune request per slice/centre change")
 
 
+def test_adapter_relaxes_once_after_drag_despite_per_frame_calls():
+    # The engine calls get_iq() every pan frame with the same centre. Those calls
+    # must not count as "the slice moved", or the relax timer never expires and
+    # the unsampled edge stays wide after every drag; and relax asks only once.
+    # Kills: dropping the input dedupe in _evaluate_lo, or relax never wired.
+    import time as _t
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    a = Flex1500Adapter(center_hz=14_074_000.0)
+    a._seeded = True
+    a._ae_center_hz = 14_074_000.0
+    a._lo_req = 14_064_000.0
+    a.set_slice(14_074_000.0)
+    a.get_iq(1024, 14_079_000.0, 48_000.0)         # drag 5 kHz: hysteresis keeps the LO
+    a.set_slice(14_079_000.0)
+    assert a._retune_to is None and a._lo_req == 14_064_000.0
+    t0 = a._lo_changed_at
+    for _ in range(50):                            # per-frame calls, same inputs
+        a.get_iq(1024, 14_079_000.0, 48_000.0)
+        a.set_slice(14_079_000.0)
+        a.set_mode("USB")
+    assert a._lo_changed_at == t0, "per-frame calls reset the relax timer"
+    a._maybe_relax(t0 + 1.0)
+    assert a._retune_to is None                    # not yet
+    a._maybe_relax(t0 + 2.5)
+    assert a._retune_to == 14_069_000.0, a._retune_to
+    a._retune_to = None
+    a._maybe_relax(t0 + 10.0)
+    assert a._retune_to is None                    # once only
+    print("ok  flex1500: relax fires once after a drag, per-frame calls ignored")
+
+
 # --- offset tuning: wire.choose_lo (stdlib) ------------------------------------
 _V = 14_074_000.0
 
