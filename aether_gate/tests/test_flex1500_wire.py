@@ -432,6 +432,8 @@ def test_lo_offset_zero_is_legacy():
     assert w.choose_lo(_V, _V, "USB", None, 0) == _V
     assert w.choose_lo(_V, _V, "LSB", _V, 0) is None
     assert w.choose_lo(_V + 5.0, _V, "USB", _V, 0) == _V + 5.0
+    # an LO that the offset policy would keep is still moved back to the centre
+    assert w.choose_lo(_V, _V, "USB", _V - 5_000.0, 0) == _V
     print("ok  flex1500: IF offset 0 = LO on the pan centre (legacy)")
 
 

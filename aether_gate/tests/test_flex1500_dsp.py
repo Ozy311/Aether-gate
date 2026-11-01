@@ -42,9 +42,11 @@ def _adapter(**kw):
 
 def test_dc_block_kills_constant_and_passes_300hz():
     """A constant (the measured codec DC, -147/+55 counts, Q stored negated)
-    is removed to well under 1 LSB, and a 300 Hz tone passes within 0.05 dB.
-    Kills: subtraction dropped (DC stays), or a corner far too high (the tone
-    is notched) — e.g. fc=300 Hz attenuates it by ~3 dB."""
+    is removed to well under 1 LSB, a 300 Hz tone passes within 0.05 dB and a
+    20 Hz tone within 0.6 dB. Kills: subtraction dropped (DC stays), or a
+    corner far too high — at fc=300 Hz the block-mean estimate tracks the
+    20 Hz tone and cancels most of it. (A 300 Hz tone alone cannot catch a high
+    corner: it averages out within one 16 ms block.)"""
     dcb = dsp.DcBlocker(FS)
     dc = complex(-147, -55) / w.FULL_SCALE
     rng = np.random.default_rng(7)
@@ -62,6 +64,13 @@ def test_dc_block_kills_constant_and_passes_300hz():
     k = np.arange(len(y)) + 100 * BLK
     amp = abs(np.mean(y * np.exp(-2j * np.pi * 300.0 * k / FS)))
     assert abs(20 * np.log10(amp / tone_amp)) < 0.05, 20 * np.log10(amp / tone_amp)
+    dcb = dsp.DcBlocker(FS)
+    out = [dcb.process((_tone(20.0, BLK, tone_amp, b * BLK) + dc).astype(np.complex64), np)
+           for b in range(n_blocks)]
+    y = np.concatenate(out[100:])
+    k = np.arange(len(y)) + 100 * BLK
+    amp20 = abs(np.mean(y * np.exp(-2j * np.pi * 20.0 * k / FS)))
+    assert abs(20 * np.log10(amp20 / tone_amp)) < 0.6, 20 * np.log10(amp20 / tone_amp)
 
 
 def test_dc_block_is_per_i_and_q():
@@ -96,9 +105,11 @@ def test_nco_shift_phase_continuous_across_blocks():
     """Shifting two adjacent blocks separately (with their sample indices) must
     equal shifting them joined. Kills: the NCO restarting each block (index 0)."""
     x = _tone(1234.0, 2 * BLK)
-    whole = dsp.nco_shift(x, -10_000.0, 5000, FS, np)
-    parts = np.concatenate([dsp.nco_shift(x[:BLK], -10_000.0, 5000, FS, np),
-                            dsp.nco_shift(x[BLK:], -10_000.0, 5000 + BLK, FS, np)])
+    sh = -9_937.5            # not a whole number of cycles per block (a real
+                             # shift is LO-quantised, never round)
+    whole = dsp.nco_shift(x, sh, 5000, FS, np)
+    parts = np.concatenate([dsp.nco_shift(x[:BLK], sh, 5000, FS, np),
+                            dsp.nco_shift(x[BLK:], sh, 5000 + BLK, FS, np)])
     assert np.max(np.abs(whole - parts)) < 1e-9
     # and the seam itself has no phase step
     d = np.angle(parts[1:] * np.conj(parts[:-1]))
@@ -199,12 +210,13 @@ def test_ingest_tags_lo_and_dc_block_switch():
 
 def test_smeter_follows_lo_offset():
     """With the DC block off and the LO 10 kHz below the slice, the S-meter
-    (slice passband) must not see the DC line; on the LO itself it would.
+    (slice passband) must not see a carrier next to the LO; metered at the LO
+    it would.
     Kills: metering at the LO instead of at slice - LO."""
     a = _adapter(dc_block=False)
     rng = np.random.default_rng(3)
     noise = ((rng.standard_normal(4096) + 1j * rng.standard_normal(4096)) / w.FULL_SCALE)
-    tone = _tone(0.0, 4096, amp=0.01)            # a carrier exactly at the LO
+    tone = _tone(500.0, 4096, amp=0.01)          # a carrier 500 Hz above the LO
     a._pan_ring.append((14_064_000.0, 0, (noise + tone).astype(np.complex64)))
     a._slice_hz = 14_074_000.0
     off = a._s_meter_dbm()
