@@ -33,13 +33,9 @@ DC and offset tuning. The codec's DC offset shows at the hardware LO (~70 dB
 over the pan's median, measured). Two independent remedies, both on by default
 and each switchable for A/B (--flex1500-no-dc-block, --flex1500-if-offset 0):
 a ~1 Hz block-wise DC block on the raw IQ before the pan and the demod, and
-offset tuning (wire.preferred_lo / wire.choose_lo): the LO sits off the slice's
-passband and scope_center_hz() has the engine centre AE's pan on that LO, so all
-48 kHz of the pan are real samples, the slice is drawn off centre and the DC
-line is at the pan centre, outside the passband (as PowerSDR showed it). When
-the pan centre and the LO differ anyway (hysteresis during a drag, AE asking for
-another centre) the IQ is shifted digitally and the |shift| Hz edge the radio
-did not sample is zeroed, not aliased.
+offset tuning (wire.choose_lo): the LO sits off the slice's passband, the IQ is
+shifted back digitally, and the |shift| Hz edge of the pan the radio did not
+sample is zeroed, not aliased.
 
 §II — what is a reading and what is not. The firmware revision, serial number
 and status byte are replies from the radio. The filter, preamp and LO are
@@ -103,9 +99,8 @@ class Flex1500Adapter(RadioAdapter):
         self._serial_override = serial
         # FLEX-6600 = HF + 6 m (RADIO_SUPPORT.md). Span is the real 48 kHz: one
         # sample rate, no zoom in hardware, so min == max. native_centered_scope:
-        # the engine centres AE's pan on scope_center_hz(slice) (the LO it will
-        # use); if AE's centre and the LO still differ, the IQ is shifted
-        # digitally so its bins are labelled for AE's centre.
+        # the engine centres AE's pan on the slice; the IQ is shifted digitally
+        # so its bins are labelled for that centre whatever the hardware LO is.
         self.capabilities = AdapterCaps(model=model, serial=serial, station=station,
                                         tx_capable=False, native_centered_scope=True,
                                         min_span_hz=float(wire.SAMPLE_RATE),
@@ -535,30 +530,18 @@ class Flex1500Adapter(RadioAdapter):
         self._slice_req_hz = slice_hz
         self._slice_hz = slice_hz
         if self.capabilities.native_centered_scope:
-            # The engine has ALREADY moved AE's pan centre to
-            # scope_center_hz(slice) when it calls this (core/engine.py, slice
-            # set: native_centered_scope branch, then _sync_active_slice).
-            # Deciding against the stale centre picked an LO for the old pan,
-            # which hysteresis then kept until the relax retune: two retunes per
-            # slice jump (found live).
-            self._ae_center_hz = self.scope_center_hz(slice_hz, self._mode)
+            # The engine has ALREADY moved AE's pan centre onto the slice when
+            # it calls this (core/engine.py, slice set: native_centered_scope
+            # branch, then _sync_active_slice). Deciding against the stale
+            # centre picked an LO for the old pan, which hysteresis then kept
+            # until the relax retune: two retunes per slice jump (found live).
+            self._ae_center_hz = slice_hz
         self._evaluate_lo()
 
     def set_mode(self, mode):
         if mode and mode.upper() != self._mode:
             self._mode = mode.upper()
-            if self.capabilities.native_centered_scope:
-                # A mode that puts the LO on the other side moves the engine's
-                # pan centre with it (same slice set); decide against that.
-                self._ae_center_hz = self.scope_center_hz(self._slice_hz, self._mode)
             self._evaluate_lo()
-
-    def scope_center_hz(self, slice_hz, mode):
-        """Where AE's pan is centred for a slice: the LO this adapter puts it
-        on (wire.preferred_lo), so the pan holds only sampled spectrum and the
-        slice sits |offset| off centre. Offset 0 -> the slice (legacy). The
-        RadioAdapter hook (adapters/base.py); the engine calls it per tune."""
-        return wire.preferred_lo(slice_hz, mode, self.if_offset_hz)
 
     # --- readback (radio -> AE) -----------------------------------------
     def read_meters(self):
@@ -670,14 +653,9 @@ class Flex1500Adapter(RadioAdapter):
             "known_artifacts": ("codec DC offset at the hardware LO (~70 dB over the "
                                 "median raw, measured 2026-11-01): removed by the DC "
                                 "block and kept out of the slice passband by the IF "
-                                "offset when those are on; the pan is centred on the "
-                                "LO, so the slice sits off centre and the DC line is at "
-                                "the pan centre; while digital_shift_hz is non-zero that "
-                                "many Hz at one pan edge are unsampled and shown as floor: "
-                                "during a slice drag until the relax retune, and for as "
-                                "long as AE holds the pan centred on the slice (centre "
-                                "lock, Center Slice); 38.4 MHz TCXO "
-                                "leaks into RX ~15-20 dB "
+                                "offset when those are on; with the offset on, "
+                                "|digital_shift_hz| at one pan edge is unsampled and "
+                                "shown as floor; 38.4 MHz TCXO leaks into RX ~15-20 dB "
                                 "above the floor; a fixed baseband pair near +/-19.4 kHz "
                                 "is not RF (does not move with the LO)"),
         }
