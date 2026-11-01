@@ -147,15 +147,7 @@ def _demod_rms(a, iq, lo, blocks=8):
 
 
 def _ready(a, mode="USB"):
-    a._decim = 2
-    a._stage_firs = []
-    for M in a._factor_decim(2):
-        ntaps = 4 * M + 1
-        idx = np.arange(ntaps) - (ntaps - 1) / 2.0
-        taps = np.sinc(2 * (0.45 / M) * idx) * np.hamming(ntaps)
-        a._stage_firs.append([taps / taps.sum(), np.zeros(ntaps - 1, np.complex128), M])
-    a._ssb_usb = dsp.ssb_taps(24_000, np)
-    a._ssb_state = np.zeros(len(a._ssb_usb) - 1, np.complex128)
+    a._init_demod(np)
     a._mode = mode
 
 

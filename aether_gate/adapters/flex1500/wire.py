@@ -370,6 +370,94 @@ class CommandChannel:
                 self._cv.notify_all()
 
 
+# --- the demodulator's passband per mode (pure, stdlib) -------------------------
+#
+# ONE table drives the demod taps (adapter._demod), the S-meter band and the LO
+# policy below, so the three cannot disagree (soapy's rule: the meter band "MUST
+# track the filters"). Offsets are Hz from the slice, sign = side of the carrier,
+# the convention AE's SliceModel uses. Edges and pitch handling follow AE's own
+# software-radio defaults (AetherSDR src/core/backends/hl2/Hl2Backend.cpp,
+# defaultPassbandForMode): SSB low cut 100 Hz, digital 150 Hz, CW centred on the
+# carrier with the pitch in the BFO, AM/FM symmetric about the carrier.
+SSB_LOW_CUT_HZ = 100           # USB/LSB: passband starts this far from the carrier
+DIG_LOW_CUT_HZ = 150           # DIGU/DIGL (AE's 150..3000 Hz window)
+CW_PITCH_HZ = 600              # the engine sends no pitch; 600 Hz (AE's default)
+DEFAULT_WIDTH_HZ = {           # until AE sends one (set_filter_width_hz)
+    "ssb": 2_700,              # 100..2800 Hz, SmartSDR's SSB default
+    "dig": 2_850,              # 150..3000 Hz, AE's digital default
+    "cw": 500,                 # carrier +/- 250 Hz
+    "am": 6_000,               # carrier +/- 3 kHz
+    "fm": 16_000,              # carrier +/- 8 kHz: Carson for 5 kHz-deviation NBFM
+}                              # (soapy's FM_PASS_HZ; 12 kHz would clip it)
+WIDTH_MIN_HZ = 50
+# Upper bounds: the 48k -> 24k decimation FIR passes ~ +/-10.8 kHz, so no edge may
+# go past 10 kHz from the carrier (one-sided modes: low cut + width <= 10 kHz).
+EDGE_MAX_HZ = 10_000
+
+LOWER_MODES = ("LSB", "DIGL", "CWL")
+_FM_MODES = ("FM", "NFM", "DFM", "FM-N")
+
+
+def demod_family(mode):
+    """What the demodulator does for an AE mode string: "usb", "lsb", "digu",
+    "digl", "cw", "cwl", "am" or "fm". Matched exactly, not by prefix: DIGL is
+    a LOWER-sideband mode (soapy/hpsdr's startswith("LSB") demodulates it as
+    upper). Anything unknown is "usb", the same fallback AE uses."""
+    m = (mode or "").upper()
+    if m == "LSB":
+        return "lsb"
+    if m == "DIGL":
+        return "digl"
+    if m == "DIGU":
+        return "digu"
+    if m in ("CW", "CWU"):
+        return "cw"
+    if m == "CWL":
+        return "cwl"
+    if m in ("AM", "SAM"):
+        return "am"
+    if m in _FM_MODES:
+        return "fm"
+    return "usb"
+
+
+def width_group(mode):
+    """The DEFAULT_WIDTH_HZ key for a mode (USB and LSB share one width)."""
+    return {"usb": "ssb", "lsb": "ssb", "digu": "dig", "digl": "dig",
+            "cw": "cw", "cwl": "cw", "am": "am", "fm": "fm"}[demod_family(mode)]
+
+
+def clamp_width(mode, width_hz):
+    """`width_hz` for `mode`, or the mode's default if None, clamped to what the
+    24 kHz audio path can pass."""
+    fam = demod_family(mode)
+    if width_hz is None:
+        return float(DEFAULT_WIDTH_HZ[width_group(mode)])
+    if fam in ("usb", "lsb"):
+        hi = EDGE_MAX_HZ - SSB_LOW_CUT_HZ
+    elif fam in ("digu", "digl"):
+        hi = EDGE_MAX_HZ - DIG_LOW_CUT_HZ
+    else:
+        hi = 2 * EDGE_MAX_HZ
+    return float(min(max(float(width_hz), WIDTH_MIN_HZ), hi))
+
+
+def demod_passband(mode, width_hz=None):
+    """(low, high) Hz from the slice that the demodulator passes for `mode` at
+    `width_hz` (None = the mode's default)."""
+    fam = demod_family(mode)
+    w = clamp_width(mode, width_hz)
+    if fam == "usb":
+        return (float(SSB_LOW_CUT_HZ), SSB_LOW_CUT_HZ + w)
+    if fam == "lsb":
+        return (-(SSB_LOW_CUT_HZ + w), -float(SSB_LOW_CUT_HZ))
+    if fam == "digu":
+        return (float(DIG_LOW_CUT_HZ), DIG_LOW_CUT_HZ + w)
+    if fam == "digl":
+        return (-(DIG_LOW_CUT_HZ + w), -float(DIG_LOW_CUT_HZ))
+    return (-w / 2.0, w / 2.0)                     # cw, cwl, am, fm: symmetric
+
+
 # --- offset tuning: where the hardware LO goes (pure, stdlib) -------------------
 #
 # The codec's DC offset (measured -147 / +55 counts on I / Q with no antenna,
@@ -395,10 +483,6 @@ IF_OFFSET_MAX_HZ = 16_000
 LO_GUARD_HZ = 1_500            # the passband may come no closer to the LO than this
 LO_DEAD_EXTRA_HZ = 6_000       # hysteresis: tolerate |LO - centre| up to offset + this
 LO_USABLE_HZ = 20_000          # passband must stay inside LO +/- this (codec roll-off)
-SSB_PASS_HZ = 3_000            # the demod's sideband filter width (adapter get_audio)
-
-LOWER_MODES = ("LSB", "DIGL", "CWL")
-SYMMETRIC_MODES = ("AM", "SAM", "FM", "NFM", "DFM", "FM-N")
 
 
 def check_if_offset(hz):
@@ -410,26 +494,19 @@ def check_if_offset(hz):
     return hz
 
 
-def mode_passband(mode):
-    """(low, high) offsets from the slice that the LO policy keeps clear, and the
-    side the LO goes on (-1 below the slice, +1 above).
-
-    Upper-sideband family (USB, DIGU, CW, anything unknown) -> 0..+3 kHz, LO
-    below; lower family -> -3..0 kHz, LO above. AM/FM -> +/-3 kHz, LO below
-    (either side works; below was picked). The adapter's demod is SSB-only, so
-    +/-3 kHz covers what it actually passes for those modes.
+def mode_passband(mode, width_hz=None):
+    """(low, high) offsets from the slice that the LO policy keeps clear (the
+    demodulator's own passband, demod_passband), and the side the LO goes on
+    (-1 below the slice, +1 above): above for the lower family (LSB, DIGL,
+    CWL), below for everything else (AM/FM work either side; below was picked).
     """
-    m = (mode or "").upper()
-    if m in LOWER_MODES:
-        return (-SSB_PASS_HZ, 0), +1
-    if m in SYMMETRIC_MODES:
-        return (-SSB_PASS_HZ, SSB_PASS_HZ), -1
-    return (0, SSB_PASS_HZ), -1
+    side = +1 if (mode or "").upper() in LOWER_MODES else -1
+    return demod_passband(mode, width_hz), side
 
 
-def lo_clearance(lo, slice_hz, mode):
+def lo_clearance(lo, slice_hz, mode, width_hz=None):
     """Hz between the LO and the nearest passband edge; negative if inside it."""
-    (a, b), _ = mode_passband(mode)
+    (a, b), _ = mode_passband(mode, width_hz)
     lo_edge, hi_edge = slice_hz + a, slice_hz + b
     if lo < lo_edge:
         return lo_edge - lo
@@ -438,21 +515,21 @@ def lo_clearance(lo, slice_hz, mode):
     return -min(lo - lo_edge, hi_edge - lo)
 
 
-def lo_ok(lo, center_hz, slice_hz, mode, offset_hz):
+def lo_ok(lo, center_hz, slice_hz, mode, offset_hz, width_hz=None):
     """True if an LO of `lo` can stay put: in coverage, the passband clear of it
     by LO_GUARD_HZ and inside its usable window, and the unsampled pan edge no
     wider than offset + LO_DEAD_EXTRA_HZ."""
     if lo is None or not in_rx_coverage(lo):
         return False
-    if lo_clearance(lo, slice_hz, mode) < LO_GUARD_HZ:
+    if lo_clearance(lo, slice_hz, mode, width_hz) < LO_GUARD_HZ:
         return False
     if abs(center_hz - lo) > offset_hz + LO_DEAD_EXTRA_HZ:
         return False
-    (a, b), _ = mode_passband(mode)
+    (a, b), _ = mode_passband(mode, width_hz)
     return max(abs(slice_hz + a - lo), abs(slice_hz + b - lo)) <= LO_USABLE_HZ
 
 
-def choose_lo(center_hz, slice_hz, mode, cur_lo, offset_hz, relax=False):
+def choose_lo(center_hz, slice_hz, mode, cur_lo, offset_hz, relax=False, width_hz=None):
     """The LO to request, or None to keep `cur_lo`.
 
     offset 0: today's behaviour, LO = pan centre (None if already there).
@@ -469,16 +546,16 @@ def choose_lo(center_hz, slice_hz, mode, cur_lo, offset_hz, relax=False):
         if cur_lo is not None and abs(cur_lo - center_hz) <= 1.0:
             return None
         return center_hz
-    if not relax and lo_ok(cur_lo, center_hz, slice_hz, mode, offset_hz):
+    if not relax and lo_ok(cur_lo, center_hz, slice_hz, mode, offset_hz, width_hz):
         return None
     _, side = mode_passband(mode)
     cands = (center_hz + side * offset_hz, center_hz - side * offset_hz, center_hz)
-    good = [c for c in cands if lo_ok(c, center_hz, slice_hz, mode, offset_hz)]
+    good = [c for c in cands if lo_ok(c, center_hz, slice_hz, mode, offset_hz, width_hz)]
     if good:
         pick = good[0]
     else:
         inside = [c for c in cands if in_rx_coverage(c)]
-        pick = (max(inside, key=lambda c: lo_clearance(c, slice_hz, mode))
+        pick = (max(inside, key=lambda c: lo_clearance(c, slice_hz, mode, width_hz))
                 if inside else center_hz)
     if cur_lo is not None and abs(pick - cur_lo) <= 1.0:
         return None

@@ -567,6 +567,72 @@ def test_defaults_lo_on_slice_and_dc_block_on():
     print("ok  flex1500: defaults are IF offset 0 and DC block on")
 
 
+# --- demod passband per mode / width (stdlib: the table, not the DSP) ---------
+
+def test_demod_passband_table_per_mode():
+    # The demod passband per AE mode at the default widths: USB/DIGU above the
+    # carrier, LSB/DIGL mirrored below, CW/AM/FM symmetric about it.
+    # Kills: DIGL demodulated as upper (soapy/hpsdr startswith("LSB") bug), a
+    # family on the wrong side, or a default width changed by accident.
+    want = {"USB": (100.0, 2800.0), "LSB": (-2800.0, -100.0),
+            "DIGU": (150.0, 3000.0), "DIGL": (-3000.0, -150.0),
+            "CW": (-250.0, 250.0), "CWL": (-250.0, 250.0),
+            "AM": (-3000.0, 3000.0), "SAM": (-3000.0, 3000.0),
+            "FM": (-8000.0, 8000.0), "NFM": (-8000.0, 8000.0), "DFM": (-8000.0, 8000.0),
+            "": (100.0, 2800.0), "RTTY": (100.0, 2800.0)}
+    for mode, band in want.items():
+        assert w.demod_passband(mode) == band, (mode, w.demod_passband(mode))
+    assert w.demod_family("DIGL") == "digl" and w.demod_family("digl") == "digl"
+    print("ok  flex1500: demod passband per mode (DIGL is lower)")
+
+
+def test_demod_passband_follows_width_and_clamps():
+    # Kills: the width ignored (one fixed filter for every width), or no clamp
+    # (an edge past the 24 kHz audio path's ~10.8 kHz, or a zero-width filter).
+    assert w.demod_passband("USB", 1500) == (100.0, 1600.0)
+    assert w.demod_passband("LSB", 1500) == (-1600.0, -100.0)
+    assert w.demod_passband("CW", 200) == (-100.0, 100.0)
+    assert w.demod_passband("AM", 10_000) == (-5000.0, 5000.0)
+    assert w.demod_passband("USB", 50_000) == (100.0, 10_000.0)
+    assert w.demod_passband("FM", 50_000) == (-10_000.0, 10_000.0)
+    assert w.demod_passband("CW", 0) == (-25.0, 25.0)
+    print("ok  flex1500: passband follows the width, clamped to the audio path")
+
+
+def test_mode_change_resets_width_to_the_new_modes_default():
+    # Ozy, 2026-11-01: "why does the filter not change when I change modes?"
+    # The engine forwards no AE `filt` command, so a mode change must bring the
+    # new mode's default width; USB<->LSB keeps a width AE set.
+    # Kills: set_mode() leaving _width_hz alone (the 1.5 kHz SSB width carried
+    # into CW / AM), or resetting it on a sideband flip.
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    a = Flex1500Adapter()
+    a.set_filter_width_hz(1500)
+    assert w.demod_passband(a._mode, a._width_hz) == (100.0, 1600.0)
+    a.set_mode("LSB")
+    assert w.demod_passband(a._mode, a._width_hz) == (-1600.0, -100.0)
+    a.set_mode("CW")
+    assert w.demod_passband(a._mode, a._width_hz) == (-250.0, 250.0)
+    a.set_mode("AM")
+    assert w.demod_passband(a._mode, a._width_hz) == (-3000.0, 3000.0)
+    a.set_mode("USB")
+    assert w.demod_passband(a._mode, a._width_hz) == (100.0, 2800.0)
+    print("ok  flex1500: a mode change brings that mode's default filter")
+
+
+def test_lo_policy_keeps_the_dc_line_out_of_the_real_passband():
+    # The opt-in offset must clear what the demod really passes: FM is
+    # +/-8 kHz now, so a 5 kHz offset puts the LO INSIDE it. With the old
+    # +/-3 kHz model the policy called that clean.
+    # Kills: the LO policy not using demod_passband / the width.
+    assert w.lo_clearance(_V - 5_000, _V, "FM") < 0
+    assert not w.lo_ok(_V - 5_000, _V - 5_000, _V, "FM", 5_000)
+    assert w.lo_ok(_V - 10_000, _V, _V, "FM", 10_000)
+    # a narrower width AE sets is what the policy then guards
+    assert w.lo_ok(_V - 5_000, _V - 5_000, _V, "FM", 5_000, width_hz=6_000)
+    print("ok  flex1500: LO policy guards the mode's real passband")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

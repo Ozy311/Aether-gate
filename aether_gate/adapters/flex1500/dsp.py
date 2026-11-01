@@ -7,8 +7,10 @@
 # Foundation, either version 3 of the License, or (at your option) any later
 # version. See LICENSE.
 #
-# ssb_taps() follows the complex one-sided SSB filter in adapters/soapy.py
-# (_init_demod), Copyright (C) 2026 Nigel Fenton (G0JKN), GPL-3.0-or-later.
+# bandpass_taps() generalises the complex one-sided SSB filter in
+# adapters/soapy.py (_init_demod), and fm_discriminate() / BlockDcRemover follow
+# its NBFM discriminator (_demod_fm), Copyright (C) 2026 Nigel Fenton (G0JKN),
+# GPL-3.0-or-later.
 #
 """Pure numpy helpers for the FLEX-1500 adapter. Every function takes the numpy
 module as an argument (the adapter imports numpy only in open()), so nothing
@@ -112,12 +114,53 @@ def mask_unsampled(x, shift_hz, fs, np):
     return np.fft.ifft(X)
 
 
-def ssb_taps(rate, np, pass_hz=3000.0, ntaps=63):
-    """Complex one-sided band-pass passing 0..+pass_hz (USB); np.conj() of it
-    passes -pass_hz..0 (LSB). A Hamming low-pass of half-width pass_hz/2,
-    shifted up by pass_hz/2."""
+DEMOD_TAPS = 255          # audio-rate filter length: Hamming, transition ~3.3*fs/N
+                         # = ~310 Hz at 24 kHz, so a 500 Hz CW filter is a filter
+                         # (soapy's 63 taps give ~1.25 kHz, wider than the CW band)
+
+
+def bandpass_taps(rate, lo_hz, hi_hz, np, ntaps=DEMOD_TAPS):
+    """Complex band-pass passing lo_hz..hi_hz (Hz, either sign; negative = below
+    the carrier): a Hamming low-pass of half-width (hi-lo)/2 shifted up to the
+    band centre (lo+hi)/2. soapy's SSB filter is the case lo=0, hi=3000."""
+    lo_hz, hi_hz = float(min(lo_hz, hi_hz)), float(max(lo_hz, hi_hz))
     k = np.arange(ntaps) - (ntaps - 1) / 2.0
-    half = (pass_hz / 2.0) / rate
+    half = ((hi_hz - lo_hz) / 2.0) / rate
+    centre = ((hi_hz + lo_hz) / 2.0) / rate
     lp = np.sinc(2 * half * k) * np.hamming(ntaps)
     lp = lp / lp.sum()
-    return (lp * np.exp(2j * np.pi * half * k)).astype(np.complex128)
+    return (lp * np.exp(2j * np.pi * centre * k)).astype(np.complex128)
+
+
+class BlockDcRemover:
+    """Per-block one-pole high-pass on a real audio signal: subtract a running
+    estimate of the block mean, a = 1 - exp(-2*pi*fc*N/fs) per block. soapy's FM
+    DC block (_demod_fm), vectorised the same way; used after the AM envelope
+    (the carrier becomes DC) and the FM discriminator (a tuning error does)."""
+
+    def __init__(self, rate, fc_hz=10.0):
+        self.rate = float(rate)
+        self.fc_hz = float(fc_hz)
+        self.dc = None
+
+    def process(self, x, np):
+        if not len(x):
+            return x
+        m = float(np.mean(x))
+        if self.dc is None:
+            self.dc = m
+        else:
+            a = 1.0 - math.exp(-2.0 * math.pi * self.fc_hz * len(x) / self.rate)
+            self.dc += a * (m - self.dc)
+        return x - self.dc
+
+
+def fm_discriminate(z, prev, np):
+    """Quadrature discriminator angle(z[n] * conj(z[n-1])) / pi, carrying the
+    previous block's last sample (`prev`) so there is no tick at the block
+    boundary. Returns (audio in -1..+1, new prev). soapy _demod_fm, including
+    its full-range scaling (divide by pi, so noise cannot clip)."""
+    if not len(z):
+        return np.zeros(0, dtype=np.float64), prev
+    p = np.concatenate([[prev], z[:-1]])
+    return np.angle(z * np.conj(p)) * (1.0 / np.pi), z[-1]

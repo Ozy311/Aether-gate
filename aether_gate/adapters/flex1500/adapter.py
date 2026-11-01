@@ -7,8 +7,8 @@
 # Foundation, either version 3 of the License, or (at your option) any later
 # version. See LICENSE.
 #
-# The SSB demod (get_audio / _factor_decim / the stage-FIR setup in open()) is
-# adapted from adapters/hpsdr/adapter.py, Copyright (C) 2026 Nigel Fenton
+# The demod front end (get_audio / _factor_decim / the stage-FIR setup in
+# _init_demod) is adapted from adapters/hpsdr/adapter.py, Copyright (C) 2026 Nigel Fenton
 # (G0JKN), GPL-3.0-or-later. Copied rather than shared so neither adapter's
 # private state becomes the other's contract; a common host-DSP helper is the
 # obvious later extraction.
@@ -159,8 +159,15 @@ class Flex1500Adapter(RadioAdapter):
         self._stage_firs = []
         self._iq_resid = None
         self._resid_lo = None                      # LO the residual samples were taken at
-        self._ssb_usb = None
-        self._ssb_state = None
+        self._width_hz = None                      # None = the mode's default (wire)
+        self._demod_key = None                     # (family, lo, hi) the taps were built for
+        self._demod_taps = None
+        self._demod_state = None
+        self._bfo_phase = 0.0                      # CW pitch oscillator
+        self._am_dc = dsp.BlockDcRemover(AUDIO_RATE)
+        self._fm_dc = dsp.BlockDcRemover(AUDIO_RATE)
+        self._fm_prev = 0j
+        self.taps_builds = 0
         self._audio_gain = 4.0
         self._agc_level = 0.05
         self._agc_target = 0.25
@@ -234,22 +241,7 @@ class Flex1500Adapter(RadioAdapter):
             # Raw u32 in hex: the radio's reply, not a reformatting of it.
             self.capabilities.serial = f"{self.serial_num:08X}"
 
-        # --- demod setup: staged anti-alias + decimate 48 kHz -> 24 kHz (hpsdr) ---
-        self._decim = max(1, int(round(self.samp_rate / AUDIO_RATE)))
-        self._stage_firs = []
-        for M in self._factor_decim(self._decim):
-            ntaps = 4 * M + 1
-            cutoff = 0.45 / M
-            idx = np.arange(ntaps) - (ntaps - 1) / 2.0
-            taps = np.sinc(2 * cutoff * idx) * np.hamming(ntaps)
-            taps = (taps / taps.sum()).astype(np.float64)
-            self._stage_firs.append([taps, np.zeros(ntaps - 1, dtype=np.complex128), M])
-        self._iq_resid = np.zeros(0, dtype=np.complex64)
-        # Sideband filter at the audio rate. Without it real() kept both
-        # sidebands (real(conj(z)) == real(z): USB and LSB were identical) and
-        # the DC line, offset-tuned 10 kHz away, still folded into the audio.
-        self._ssb_usb = dsp.ssb_taps(AUDIO_RATE, np, pass_hz=wire.SSB_PASS_HZ)
-        self._ssb_state = np.zeros(len(self._ssb_usb) - 1, dtype=np.complex128)
+        self._init_demod(np)
 
         # Start the IQ stream: submitting iso IN transfers is all it takes.
         for _ in range(N_ISO_XFERS):
@@ -277,6 +269,23 @@ class Flex1500Adapter(RadioAdapter):
               f"filter {self.filter_index}, preamp {self.preamp_db:+d} dB, "
               f"DC block {'on' if self.dc_block else 'off'}, IF offset "
               f"{self.if_offset_hz} Hz (RX only)", flush=True)
+
+    def _init_demod(self, np):
+        """Staged anti-alias + decimate 48 kHz -> 24 kHz (hpsdr). The mode
+        filter itself is built lazily by _demod_filter() on the audio thread,
+        and only when the mode or width changes."""
+        self._np = np
+        self._decim = max(1, int(round(self.samp_rate / AUDIO_RATE)))
+        self._stage_firs = []
+        for M in self._factor_decim(self._decim):
+            ntaps = 4 * M + 1
+            cutoff = 0.45 / M
+            idx = np.arange(ntaps) - (ntaps - 1) / 2.0
+            taps = np.sinc(2 * cutoff * idx) * np.hamming(ntaps)
+            taps = (taps / taps.sum()).astype(np.float64)
+            self._stage_firs.append([taps, np.zeros(ntaps - 1, dtype=np.complex128), M])
+        self._iq_resid = np.zeros(0, dtype=np.complex64)
+        self._demod_key = None
 
     def close(self):
         self._run = False
@@ -473,14 +482,15 @@ class Flex1500Adapter(RadioAdapter):
     def _evaluate_lo(self, force=False):
         with self._lo_lock:
             center = self._ae_center_hz if self._ae_center_hz is not None else self._slice_hz
-            inputs = (center, self._slice_hz, self._mode)
+            inputs = (center, self._slice_hz, self._mode, self._width_hz)
             if not force and inputs == self._lo_inputs:
                 return
             self._lo_inputs = inputs
             self._lo_changed_at = time.monotonic()
             self._relaxed = False
             cur = None if force else self._lo_req
-            lo = wire.choose_lo(center, self._slice_hz, self._mode, cur, self.if_offset_hz)
+            lo = wire.choose_lo(center, self._slice_hz, self._mode, cur, self.if_offset_hz,
+                                width_hz=self._width_hz)
             if lo is not None:
                 self._lo_req = lo
                 self._retune_to = lo
@@ -496,9 +506,9 @@ class Flex1500Adapter(RadioAdapter):
             if now - self._lo_changed_at < RELAX_S:
                 return
             self._relaxed = True
-            center, slice_hz, mode = self._lo_inputs
+            center, slice_hz, mode, width = self._lo_inputs
             lo = wire.choose_lo(center, slice_hz, mode, self._lo_req, self.if_offset_hz,
-                                relax=True)
+                                relax=True, width_hz=width)
             if lo is not None:
                 self._lo_req = lo
                 self._retune_to = lo
@@ -541,9 +551,35 @@ class Flex1500Adapter(RadioAdapter):
         self._evaluate_lo()
 
     def set_mode(self, mode):
+        """Demod mode. A change to another width group (SSB, digital, CW, AM,
+        FM) drops back to that group's default width: the engine forwards no
+        AE `filt` command, so without this a mode change kept the old filter
+        (Ozy, 2026-11-01: "why does the filter not change when I change
+        modes?"). USB<->LSB keeps the width. In a `slice set` the engine calls
+        set_mode() before set_filter_width_hz(), so an explicit width AE sends
+        with the mode still wins."""
         if mode and mode.upper() != self._mode:
-            self._mode = mode.upper()
+            new = mode.upper()
+            if wire.width_group(new) != wire.width_group(self._mode):
+                self._width_hz = None
+            self._mode = new
+            a, b = wire.demod_passband(self._mode, self._width_hz)
+            print(f"[flex1500] mode {self._mode}: demod {wire.demod_family(self._mode)}, "
+                  f"passband {a:+.0f}..{b:+.0f} Hz", flush=True)
             self._evaluate_lo()
+
+    def set_filter_width_hz(self, hz):
+        """Passband width from AE (the engine passes |filter_high - filter_low|
+        from a `slice set`). Edges are not used: the mode places the band
+        (wire.demod_passband). Clamped to what the 24 kHz audio path passes."""
+        w = wire.clamp_width(self._mode, float(hz))
+        if w == self._width_hz:
+            return
+        self._width_hz = w
+        a, b = wire.demod_passband(self._mode, w)
+        print(f"[flex1500] set_filter_width_hz {float(hz):.0f} -> {w:.0f} Hz "
+              f"({self._mode}: passband {a:+.0f}..{b:+.0f} Hz)", flush=True)
+        self._evaluate_lo()
 
     # --- readback (radio -> AE) -----------------------------------------
     def read_meters(self):
@@ -552,8 +588,9 @@ class Flex1500Adapter(RadioAdapter):
         panadapter (core.fft.dbm_offset_for with the engine's defaults), so pan
         and meter agree with each other, not with a reference.
 
-        Measured over the demodulated passband (slice - LO, the mode's
-        sideband), so it follows the real LO and the digital shift: with the LO
+        Measured over the demodulated passband (wire.demod_passband for the
+        mode and width, around slice - LO), so it follows the real LO, the
+        mode and the filter width: with the LO
         offset, the DC line is outside that band. The block mean is removed
         first as well, for when the DC block is switched off: with no antenna
         the codec's DC offset (measured about -147 / +55 counts on I / Q) sits
@@ -572,13 +609,15 @@ class Flex1500Adapter(RadioAdapter):
         blk, lo, _ = got
         if not len(blk):
             return -140.0
-        x = (blk - blk.mean()).astype(np.complex128)
-        w = np.hanning(len(x))
+        w = np.hanning(len(blk))
+        x = blk.astype(np.complex128)
+        # Remove the WINDOWED mean: a plain mean of a tone 1 kHz off is not 0
+        # over a block, and subtracting it planted a Hann main lobe at 0 Hz,
+        # which a passband straddling the carrier (CW, AM, FM) then metered.
+        x = x - np.sum(x * w) / np.sum(w)
         X = np.fft.fft(x * w)
         f = np.fft.fftfreq(len(x), 1.0 / self.samp_rate)
-        (a, b), _ = wire.mode_passband(self._mode)
-        if self._mode in wire.SYMMETRIC_MODES:
-            a, b = 0, wire.SSB_PASS_HZ            # the demod passes the upper side only
+        a, b = wire.demod_passband(self._mode, self._width_hz)   # what the demod passes
         f_off = self._slice_hz - (lo if lo is not None else self._slice_hz)
         band = (f >= f_off + a) & (f <= f_off + b)
         # Parseval with the window's energy: the band's mean-square amplitude.
@@ -635,6 +674,14 @@ class Flex1500Adapter(RadioAdapter):
                 "dc_before_removal_dbfs": (round(20.0 * math.log10(
                     max(abs(self._dc.dc), 1e-12)), 1) if dc else None),
                 "note": "measured from the IQ (running estimate), before removal",
+            },
+            "demod": {
+                "mode": self._mode, "detector": wire.demod_family(self._mode),
+                "passband_hz": list(wire.demod_passband(self._mode, self._width_hz)),
+                "width_hz": wire.clamp_width(self._mode, self._width_hz),
+                "width_from_ae": self._width_hz is not None,
+                "cw_pitch_hz": wire.CW_PITCH_HZ, "taps": dsp.DEMOD_TAPS,
+                "taps_builds": self.taps_builds,
             },
             "status_byte": f"0x{st:02x}" if st is not None else None,
             "status_inputs": wire.decode_status(st) if st is not None else None,
@@ -733,7 +780,8 @@ class Flex1500Adapter(RadioAdapter):
     def get_audio(self, n_samples, slice_hz=None, mode=None):
         """n_samples of 24 kHz mono audio from the live IQ, or None until enough
         is buffered. Mix the slice to baseband (against the LO the samples were
-        captured at), decimate 48k -> 24k, sideband filter, real part, light AGC."""
+        captured at), decimate 48k -> 24k, mode filter + detector (_demod),
+        light AGC."""
         np = self._np
         if np is None or not self._stage_firs:
             return None
@@ -783,8 +831,51 @@ class Flex1500Adapter(RadioAdapter):
         if len(base) < n_samples:
             base = np.concatenate([base, np.zeros(n_samples - len(base), dtype=base.dtype)])
 
-        taps = np.conj(self._ssb_usb) if self._mode in wire.LOWER_MODES else self._ssb_usb
-        x = np.concatenate([self._ssb_state, base])
+        return self._detect(base)
+
+    def _demod_filter(self):
+        """The audio-rate mode filter for the current mode and width, rebuilt
+        only when (family, passband) changes, never per block. A rebuild clears
+        the filter history and the AM/FM detector state, so nothing from the
+        previous mode leaks into the first block of the new one."""
+        np = self._np
+        fam = wire.demod_family(self._mode)
+        a, b = wire.demod_passband(self._mode, self._width_hz)
+        key = (fam, a, b)
+        if key != self._demod_key:
+            self._demod_taps = dsp.bandpass_taps(AUDIO_RATE, a, b, np)
+            self._demod_state = np.zeros(len(self._demod_taps) - 1, dtype=np.complex128)
+            self._am_dc = dsp.BlockDcRemover(AUDIO_RATE)
+            self._fm_dc = dsp.BlockDcRemover(AUDIO_RATE)
+            self._fm_prev = 0j
+            self._demod_key = key
+            self.taps_builds += 1
+        return fam, self._demod_taps
+
+    def _detect(self, base):
+        """Mode filter then detector, on 24 kHz complex baseband (slice at 0 Hz).
+
+        usb/lsb/digu/digl: the one-sided passband, real part (product detector).
+        cw/cwl: carrier +/- width/2, then a CW_PITCH_HZ BFO (+ for CW, - for
+            CWL) before the real part, so a carrier ON the slice is heard at
+            the pitch, as on a Flex (AE: the pitch is in the BFO).
+        am: carrier +/- width/2, envelope |z|, carrier (DC) removed.
+        fm: carrier +/- width/2, quadrature discriminator, DC removed; no
+            de-emphasis (soapy leaves it off: data modes are not pre-emphasised).
+        """
+        np = self._np
+        fam, taps = self._demod_filter()
+        x = np.concatenate([self._demod_state, base])
         y = np.convolve(x, taps, mode="valid")
-        self._ssb_state = x[len(x) - (len(taps) - 1):]
+        self._demod_state = x[len(x) - (len(taps) - 1):]
+        if fam == "am":
+            return self._am_dc.process(np.abs(y), np)
+        if fam == "fm":
+            d, self._fm_prev = dsp.fm_discriminate(y, self._fm_prev, np)
+            return self._fm_dc.process(d, np)
+        if fam in ("cw", "cwl"):
+            step = (2.0 if fam == "cw" else -2.0) * np.pi * wire.CW_PITCH_HZ / AUDIO_RATE
+            ph = self._bfo_phase + step * np.arange(len(y))
+            self._bfo_phase = (self._bfo_phase + step * len(y)) % (2.0 * np.pi)
+            return np.real(y * np.exp(1j * ph))
         return np.real(y)
