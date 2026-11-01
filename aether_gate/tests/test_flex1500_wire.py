@@ -301,6 +301,45 @@ def test_adapter_failed_write_keeps_previous_lo():
     print("ok  flex1500: failed TW write keeps the previous LO")
 
 
+def test_adapter_diagnostics_before_open():
+    # The control panel may poll before or after open(); neither diagnostics()
+    # nor read_meters() may raise, and the no-read-back caveat must be there (§II).
+    # Kills: a broken import or attribute on the diagnostics path (found live:
+    # a wrong relative import took /diagnostics down with a 500).
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    a = Flex1500Adapter()
+    d = a.diagnostics()
+    assert d["radio"] == "FLEX-1500" and "no read-back" in d["commanded_note"], d
+    assert d["counters"]["cmd_refused"] == 0 and d["status_byte"] is None
+    assert a.read_meters().s_meter_dbm == -140.0 and a.read_meters().noise_dbm is None
+    print("ok  flex1500: diagnostics/read_meters safe before open")
+
+
+def test_smeter_ignores_codec_dc():
+    # Measured with no antenna: codec DC (~-147/+55 counts) sits ~45 dB above
+    # the ~1 LSB noise. The derived S-meter must report the noise, not the DC.
+    # Kills: dropping the block-mean removal in _s_meter_dbm.
+    try:
+        import numpy as np
+    except ImportError:
+        print("skip flex1500: S-meter DC test needs numpy")
+        return
+    from aether_gate.adapters.flex1500 import Flex1500Adapter
+    a = Flex1500Adapter()
+    a._np = np
+    rng = np.random.default_rng(1)
+    n = 4096
+    noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) / w.FULL_SCALE
+    dc = complex(-147, -55) / w.FULL_SCALE        # conjugated Q, as the adapter stores it
+    a._pan_ring.append((noise + dc).astype(np.complex64))
+    with_dc = a._s_meter_dbm()
+    a._pan_ring.clear()
+    a._pan_ring.append(noise.astype(np.complex64))
+    noise_only = a._s_meter_dbm()
+    assert abs(with_dc - noise_only) < 1.0, (with_dc, noise_only)
+    print("ok  flex1500: S-meter removes codec DC")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

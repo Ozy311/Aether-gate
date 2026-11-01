@@ -47,6 +47,7 @@ import threading
 import time
 
 from ..base import RadioAdapter, AdapterCaps, Meters
+from ...core.fft import dbm_offset_for   # stdlib-safe: numpy is optional there
 from . import wire
 
 AUDIO_RATE = 24_000          # AE remote_audio_rx rate (must match core AUDIO_RATE)
@@ -446,7 +447,6 @@ class Flex1500Adapter(RadioAdapter):
         blk = self._recent(METER_SAMPLES)
         if blk is None or not len(blk):
             return -140.0
-        from ..core.fft import dbm_offset_for
         x = blk - blk.mean()
         rms = float(np.sqrt(np.mean(np.abs(x) ** 2))) + 1e-12
         dbm = 20.0 * np.log10(rms) + dbm_offset_for(20.0)
